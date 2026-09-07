@@ -427,31 +427,56 @@ function flushPending() {
   if (!pendingNotes.length || !audioCtx || audioCtx.state !== 'running') return
   const batch = pendingNotes.splice(0)
   for (const item of batch) {
-    try { if (scheduleNoteNow(item.index)) audioStats.notesFlushed++ } catch (e) {}
+    try { if (scheduleNoteNow(item.index, item.pan ?? 0)) audioStats.notesFlushed++ } catch (e) {}
   }
 }
 
-// 弹奏单个音调（指数衰减，类似木琴/钟琴）
-function strike(freq, t0, type, peak, decay) {
+// —— 左右声道定位 ——
+// 用 StereoPannerNode 把每个碰撞音定位到 −1(全左) ~ +1(全右)；
+// 不支持（旧浏览器）时退化为单声道居中播放，不影响发声。
+let stereoPanSupport = null
+function panSupported() {
+  if (stereoPanSupport === null) {
+    const AC = window.AudioContext || window['webkitAudioContext']
+    stereoPanSupport = !!(AC && AC.prototype && typeof AC.prototype.createStereoPanner === 'function')
+  }
+  return stereoPanSupport
+}
+// 返回本音符的目标输出节点：pan≈0 直接用主总线；否则创建挂到主总线上的 panner
+function pannedOut(pan) {
+  const pv = Math.max(-1, Math.min(1, Number(pan) || 0))
+  if (pv !== 0 && panSupported()) {
+    const node = audioCtx.createStereoPanner()
+    node.pan.value = pv
+    node.connect(masterGain)
+    return node
+  }
+  return masterGain
+}
+
+// 弹奏单个音调（指数衰减，类似木琴/钟琴）；pan：−1 左 / 0 中 / +1 右
+function strike(freq, t0, type, peak, decay, pan) {
   const osc = audioCtx.createOscillator()
   const g = audioCtx.createGain()
+  const out = pannedOut(pan)
   osc.type = type
   osc.frequency.value = freq
   g.gain.setValueAtTime(0.0001, t0)
   g.gain.exponentialRampToValueAtTime(peak, t0 + 0.005)
   g.gain.exponentialRampToValueAtTime(0.0001, t0 + decay)
   osc.connect(g)
-  g.connect(masterGain)
+  g.connect(out)
   osc.start(t0)
   osc.stop(t0 + decay + 0.05)
   osc.onended = () => {
     osc.disconnect()
     g.disconnect()
+    if (out !== masterGain) out.disconnect()
   }
 }
 
-// 撞击瞬态（短促带通噪声，模拟“触碰直线”的物理感）
-function noiseHit(t0, dur) {
+// 撞击瞬态（短促带通噪声，模拟“触碰直线”的物理感）；pan：−1 左 / 0 中 / +1 右
+function noiseHit(t0, dur, pan) {
   if (!noiseBuffer || !masterGain) return
   const src = audioCtx.createBufferSource()
   src.buffer = noiseBuffer
@@ -460,33 +485,36 @@ function noiseHit(t0, dur) {
   filter.frequency.value = 2600
   filter.Q.value = 0.8
   const g = audioCtx.createGain()
+  const out = pannedOut(pan)
   g.gain.setValueAtTime(0.0001, t0)
   g.gain.exponentialRampToValueAtTime(0.45, t0 + 0.005)
   g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur)
   src.connect(filter)
   filter.connect(g)
-  g.connect(masterGain)
+  g.connect(out)
   src.start(t0)
   src.stop(t0 + dur + 0.02)
   src.onended = () => {
     src.disconnect()
     filter.disconnect()
     g.disconnect()
+    if (out !== masterGain) out.disconnect()
   }
 }
 
 // 真正调度音符：仅在 ctx 处于 running 且未静音时执行
-function scheduleNoteNow(index) {
+// pan：−1 = 左端点碰撞（左声道） / 0 = 居中（如试听） / +1 = 右端点碰撞（右声道）
+function scheduleNoteNow(index, pan = 0) {
   if (muted.value || !audioCtx || !masterGain || audioCtx.state !== 'running') return false
   const t0 = audioCtx.currentTime
   const semi = index % 7
   const oct = Math.floor(index / 7)
   const f = NOTE_FREQS[semi] * Math.pow(2, oct)
   try {
-    noiseHit(t0, 0.035)                  // 物理撞击瞬态
-    strike(f, t0, 'sine', 0.5, 0.9)      // 基音（较长、更易被听到）
-    strike(f * 2.01, t0, 'sine', 0.12, 0.28) // 八度泛音“叮”
-    strike(f * 4.07, t0, 'sine', 0.06, 0.1)  // 高频亮色
+    noiseHit(t0, 0.035, pan)              // 物理撞击瞬态
+    strike(f, t0, 'sine', 0.5, 0.9, pan)  // 基音（较长、更易被听到）
+    strike(f * 2.01, t0, 'sine', 0.12, 0.28, pan) // 八度泛音“叮”
+    strike(f * 4.07, t0, 'sine', 0.06, 0.1, pan)  // 高频亮色
     audioStats.notesScheduled++
     return true
   } catch (err) {
@@ -496,17 +524,18 @@ function scheduleNoteNow(index) {
 }
 
 // 第 index 个点（距原点由近及远，0 起）触线时发声：
-// 音高 = do re mi fa sol la si 循环，每超过 7 个升一个八度。
+// 音高 = do re mi fa sol la si 循环，每超过 7 个升一个八度；
+// 声像 = 左端点碰撞→左声道(−1)，右端点碰撞→右声道(+1)。
 // ctx 尚未 running（首次交互未解锁/被策略拦截）时不丢弃：入队等解锁补发。
-function playCollisionNote(index) {
+function playCollisionNote(index, pan = 0) {
   audioStats.noteAttempts++
   if (muted.value) return
   if (audioCtx && audioCtx.state === 'running') {
-    scheduleNoteNow(index)
+    scheduleNoteNow(index, pan)
     return
   }
   if (buildAudioGraph()) {
-    if (pendingNotes.length < 32) pendingNotes.push({ index })
+    if (pendingNotes.length < 32) pendingNotes.push({ index, pan })
     unlockAudio()
   }
 }
@@ -592,7 +621,8 @@ function impactAtEnd(p, index) {
   sim.ripples.push({ x: sideX, y: sim.cy, age: 0 })
   if (sim.ripples.length > 24) sim.ripples.shift()
   audioStats.collisions++
-  playCollisionNote(index) // 对应音符：距原点最近的=Do，向外依次升调
+  const pan = p.pos <= 0 ? 1 : -1 // 右端点触线 → 右声道(+1)；左端点触线 → 左声道(−1)
+  playCollisionNote(index, pan)   // 对应音符：距原点最近的=Do，向外依次升调
 }
 
 function update(dt) {
@@ -893,7 +923,7 @@ if (AUDIO_DEBUG) {
     <header class="sim-header">
       <div>
         <h1>半圆往返 · 弹性反弹 · 音阶碰撞</h1>
-        <p class="sub">默认 28 个点，沿各自上方半圆路径往返，触线反弹并发声；最内层每 900s 往返 127 次、最外层 100 次（内快外慢）；音高按距原点由近及远为 Do Re Mi Fa Sol La Si，超 7 点升八度循环</p>
+        <p class="sub">默认 28 个点，沿各自上方半圆路径往返，触线反弹并发声；最内层每 900s 往返 127 次、最外层 100 次（内快外慢）；音高按距原点由近及远为 Do Re Mi Fa Sol La Si，超 7 点升八度循环；碰撞音随触线侧分左右声道（左端点→左声道，右端点→右声道）</p>
       </div>
       <div class="header-actions">
         <span class="clock-chip" title="播放自开始/重置以来的实际流逝时间（暂停期间不计）">
@@ -990,6 +1020,7 @@ if (AUDIO_DEBUG) {
         <span class="lg"><i class="sw conn"></i>到原点连线</span>
         <span class="lg"><i class="sw origin"></i>原点</span>
         <span class="lg"><i class="sw dot"></i>运动点</span>
+        <span class="lg"><i class="sw stereo"></i>碰左端→左声道 · 碰右端→右声道</span>
       </div>
     </div>
 
@@ -1349,6 +1380,7 @@ if (AUDIO_DEBUG) {
 .sw.conn { background: #94d2fa; opacity: 0.16; height: 2px; width: 26px; }
 .sw.origin { background: radial-gradient(circle at 30% 30%, #fff7ed, #f59e0b); height: 10px; width: 10px; border-radius: 50%; }
 .sw.dot { background: radial-gradient(circle at 30% 30%, #fff, #0ea5e9); height: 10px; width: 10px; border-radius: 50%; }
+.sw.stereo { background: linear-gradient(90deg, #38bdf8 0 50%, #f472b6 50% 100%); height: 10px; width: 10px; border-radius: 3px; }
 
 /* ---------- panel ---------- */
 .panel {
