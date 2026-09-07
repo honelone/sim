@@ -177,11 +177,117 @@ let lastLabelTick = 0
 const timeReal = ref('00:00.0')
 const timeVirt = ref('00:00.0')
 
+// —— 时间定位（seek）状态 ——
+const seekText = ref('00:00') // 输入框文本，格式 mm:ss 或纯秒数
+const quickSel = ref('')      // 快速选择下拉（用于复位选中态）
+
+const TIME_PRESETS = [
+  { label: '起点 00:00', value: 0 },
+  { label: '00:15', value: 15 },
+  { label: '00:30', value: 30 },
+  { label: '01:00', value: 60 },
+  { label: '03:00', value: 180 },
+  { label: '07:30', value: 450 },
+  { label: '12:00', value: 720 },
+  { label: '15:00（900s）', value: 900 },
+]
+
 function fmtClock(s) {
   const m = Math.floor(s / 60)
   const sec = Math.floor(s % 60)
   const t = Math.floor((s * 10) % 10)
   return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}.${t}`
+}
+function fmtMMSS(s) {
+  const m = Math.floor(s / 60)
+  const sec = Math.floor(s % 60)
+  return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
+}
+// 解析手动输入：支持 mm:ss（1~2 位分 + 0~59 秒）或纯秒数（如 90 / 12.5）
+function parseSeekSeconds(text) {
+  const txt = String(text || '').trim()
+  if (!txt) return null
+  if (/^\d{1,3}(\.\d+)?$/.test(txt)) return parseFloat(txt)
+  const m = /^(\d{1,2}):([0-5]?\d)(\.\d+)?$/.exec(txt)
+  if (m) return parseInt(m[1], 10) * 60 + parseFloat(m[2] + (m[3] || ''))
+  return null
+}
+
+// 与 update() 完全一致的“按层周期数”插值：i=0 最内层 127 … 最外层 100
+function cyclesFor(i, n) {
+  return n > 1 ? CYCLE_INNER - ((CYCLE_INNER - CYCLE_OUTER) / (n - 1)) * i : CYCLE_INNER
+}
+
+// 解析定位：点在弧参数 pos∈[0,L] 上做匀速三角波往返。
+// 半程时长 half = 900/(2·cycles)，t 落在半程内即 pos 递减(从左端→右端)，否则递增(右→左)
+function sampleAt(t, i, n) {
+  const p = sim.dots[i]
+  const half = CYCLE_PERIOD / (2 * cyclesFor(i, n))
+  const full = half * 2
+  let u = t % full
+  if (u < 0) u += full
+  if (u <= half) return { pos: p.L * (1 - u / half), dir: -1 }
+  return { pos: p.L * ((u - half) / half), dir: 1 }
+}
+
+// 跳到任意等效时间秒数（0~900）。立即重算各点位置并刷新画面；
+// 之后点“播放”即从该位置沿时间轴继续推进。
+function seekEq(secsRaw, quiet = false) {
+  const secs = Number(secsRaw)
+  if (!Number.isFinite(secs)) {
+    if (!quiet) flashNotice('请输入有效时间，如 05:30 或 330（秒）', 2600)
+    return
+  }
+  const clamped = Math.min(Math.max(secs, 0), CYCLE_PERIOD)
+  if (!quiet && clamped !== secs) {
+    flashNotice(`定位时间需在 0:00 ~ 15:00 之间，已调整为 ${fmtMMSS(clamped)}`, 3000)
+  }
+  const n = sim.dots.length
+  for (let i = 0; i < n; i++) {
+    const s = sampleAt(clamped, i, n)
+    const p = sim.dots[i]
+    p.pos = s.pos
+    p.dir = s.dir
+    p.bounce = -1 // 一次性跳转不触发弹跳波纹/碰撞音
+  }
+  sim.ripples.length = 0
+  const scale = Number(speedScale.value) || 1
+  virtElapsed = clamped
+  realElapsed = clamped / scale // 保持“等效 = 实际 × 倍速”的口径
+  lastLabelTick = 0
+  timeVirt.value = fmtClock(clamped)
+  timeReal.value = fmtClock(clamped / scale)
+  seekText.value = fmtMMSS(clamped)
+  render()
+}
+
+function applySeekInput() {
+  const secs = parseSeekSeconds(seekText.value)
+  if (secs === null) {
+    seekText.value = fmtMMSS(Math.round(virtElapsed)) // 非法则回显当前
+    flashNotice('格式示例：03:20、15:00 或 200（秒）', 2800)
+    return
+  }
+  seekEq(secs)
+  flashNotice(`已定位到 ${fmtMMSS(Math.min(Math.max(secs, 0), CYCLE_PERIOD))} 的瞬时位置`, 1600)
+}
+
+// 输入过程中即时定位（合法即生效），便于“输入/选择任意时间立即显示”
+function seekLive() {
+  const secs = parseSeekSeconds(seekText.value)
+  if (secs !== null && secs >= 0 && secs <= CYCLE_PERIOD) seekEq(secs, true)
+}
+
+function onPresetJump() {
+  const v = Number(quickSel.value)
+  if (!Number.isFinite(v)) return
+  quickSel.value = ''
+  seekEq(v)
+  flashNotice(`已定位到 ${fmtMMSS(v)}`, 1600)
+}
+
+function nudgeSeek(delta) {
+  seekEq(virtElapsed + delta, true)
 }
 
 function reset() {
@@ -198,6 +304,7 @@ function reset() {
   lastLabelTick = 0
   timeReal.value = '00:00.0'
   timeVirt.value = '00:00.0'
+  seekText.value = '00:00'
 }
 
 function togglePlay() {
@@ -795,6 +902,27 @@ if (AUDIO_DEBUG) {
         <span class="clock-chip" title="等效周期时间 = 实际时间 × 倍速。×1 时到 15:00 即对应规则中的 900s：最内层往返 127 次、最外层 100 次；倍速越高到点越快">
           <b>等效</b><em>{{ timeVirt }}</em> / 15:00
         </span>
+        <span class="seek-chip">
+          <b class="seek-label">定位</b>
+          <input
+            class="seek-input"
+            v-model="seekText"
+            inputmode="decimal"
+            spellcheck="false"
+            placeholder="mm:ss"
+            title="输入 mm:ss（如 07:30）或纯秒数（如 450），回车跳转；范围 0:00 ~ 15:00"
+            @input="seekLive"
+            @keydown.enter.prevent="applySeekInput"
+            @keydown.esc="seekText = fmtMMSS(Math.round(virtElapsed))"
+          />
+          <select v-model="quickSel" class="seek-select" title="快速选择预设时刻" @change="onPresetJump">
+            <option value="" disabled>快捷…</option>
+            <option v-for="p in TIME_PRESETS" :key="p.value" :value="p.value">{{ p.label }}</option>
+          </select>
+          <button class="seek-btn" title="后退 10 秒" @click="nudgeSeek(-10)">−10s</button>
+          <button class="seek-btn" title="前进 10 秒" @click="nudgeSeek(10)">+10s</button>
+          <button class="seek-btn go" title="跳转到输入的时间点" @click="applySeekInput">跳转</button>
+        </span>
         <span class="audio-state" :class="audioChipCls" :title="audioChipTitle">
           <i></i>{{ audioChipText }}
         </span>
@@ -980,6 +1108,71 @@ if (AUDIO_DEBUG) {
   color: #7dd3fc;
   font-style: normal;
   font-weight: 600;
+}
+.seek-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(56, 189, 248, 0.28);
+  background: rgba(15, 23, 42, 0.55);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.seek-label {
+  color: var(--text-3);
+  font-weight: 500;
+  margin-right: 2px;
+}
+.seek-input {
+  width: 62px;
+  padding: 3px 6px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(2, 6, 23, 0.72);
+  color: var(--text-1);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  outline: none;
+}
+.seek-input:focus {
+  border-color: #38bdf8;
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.18);
+}
+.seek-input::placeholder {
+  color: var(--text-3);
+  opacity: 0.6;
+}
+.seek-select {
+  padding: 3px 4px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(2, 6, 23, 0.72);
+  color: var(--text-1);
+  font-size: 12px;
+  outline: none;
+  max-width: 96px;
+}
+.seek-btn {
+  padding: 3px 7px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(30, 41, 59, 0.6);
+  color: var(--text-2);
+  font-size: 11px;
+  cursor: pointer;
+  line-height: 1.4;
+}
+.seek-btn:hover {
+  border-color: #38bdf8;
+  color: var(--text-1);
+  background: rgba(56, 189, 248, 0.12);
+}
+.seek-btn.go {
+  border-color: rgba(56, 189, 248, 0.45);
+  color: #7dd3fc;
 }
 .audio-state {
   display: inline-flex;
