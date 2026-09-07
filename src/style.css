@@ -1,0 +1,36 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg-0: #05070d;
+  --bg-1: #0a1120;
+  --bg-2: #101c33;
+  --panel: rgba(15, 23, 42, 0.72);
+  --border: rgba(148, 163, 184, 0.16);
+  --text-1: #e2e8f0;
+  --text-2: #94a3b8;
+  --text-3: #64748b;
+  --accent: #38bdf8;
+  --accent-2: #22d3ee;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui,
+    -apple-system, sans-serif;
+  color: var(--text-1);
+  background:
+    radial-gradient(1100px 700px at 75% -10%, rgba(56, 189, 248, 0.14), transparent 60%),
+    radial-gradient(900px 600px at 15% 110%, rgba(34, 211, 238, 0.1), transparent 60%),
+    linear-gradient(160deg, var(--bg-1) 0%, var(--bg-0) 100%);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
