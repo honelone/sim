@@ -168,6 +168,22 @@ function stepCount(delta) {
   setCount((Number(countInput.value) || 1) + delta)
 }
 
+/* ---------- 计时显示 ---------- */
+// 真实时间 realElapsed 按帧累计；等效周期时间 virtElapsed 再乘演示倍速，
+// 即 ×N 下 900s/N 的真实时长就对应规则里的 900s
+let realElapsed = 0
+let virtElapsed = 0
+let lastLabelTick = 0
+const timeReal = ref('00:00.0')
+const timeVirt = ref('00:00.0')
+
+function fmtClock(s) {
+  const m = Math.floor(s / 60)
+  const sec = Math.floor(s % 60)
+  const t = Math.floor((s * 10) % 10)
+  return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}.${t}`
+}
+
 function reset() {
   playing.value = false
   unlockAudio() // 空格 R 等用户手势内解锁音频
@@ -177,6 +193,11 @@ function reset() {
     p.dir = -1
     p.bounce = -1
   })
+  realElapsed = 0
+  virtElapsed = 0
+  lastLabelTick = 0
+  timeReal.value = '00:00.0'
+  timeVirt.value = '00:00.0'
 }
 
 function togglePlay() {
@@ -469,6 +490,9 @@ function impactAtEnd(p, index) {
 
 function update(dt) {
   const scale = Number(speedScale.value) || 1
+  // 累计计时：真实流逝 + 按倍速折算的等效周期时间
+  realElapsed += dt
+  virtElapsed += dt * scale
   // 往返次数按层线性过渡：i=0(最内层)=CYCLE_INNER … 最外层=CYCLE_OUTER
   const n = sim.dots.length
   const step = n > 1 ? (CYCLE_INNER - CYCLE_OUTER) / (n - 1) : 0
@@ -681,7 +705,15 @@ function tick(ts) {
   rafId = requestAnimationFrame(tick)
   const dt = lastTs ? Math.min(Math.max((ts - lastTs) / 1000, 0), MAX_FRAME) : 0
   lastTs = ts
-  if (playing.value) update(dt)
+  if (playing.value) {
+    update(dt)
+    // 计时标签每 ~100ms 刷新一次（避免每帧触发 Vue 重渲染）
+    if (ts - lastLabelTick >= 100) {
+      lastLabelTick = ts
+      timeReal.value = fmtClock(realElapsed)
+      timeVirt.value = fmtClock(virtElapsed)
+    }
+  }
   audioSupervisor()
   render()
 }
@@ -753,6 +785,12 @@ if (AUDIO_DEBUG) {
         <p class="sub">默认 28 个点，沿各自上方半圆路径往返，触线反弹并发声；最内层每 900s 往返 127 次、最外层 100 次（内快外慢）；音高按距原点由近及远为 Do Re Mi Fa Sol La Si，超 7 点升八度循环</p>
       </div>
       <div class="header-actions">
+        <span class="clock-chip" title="播放自开始/重置以来的实际流逝时间（暂停期间不计）">
+          <b>运行</b><em>{{ timeReal }}</em>
+        </span>
+        <span class="clock-chip" title="等效周期时间 = 实际时间 × 倍速。×1 时到 15:00 即对应规则中的 900s：最内层往返 127 次、最外层 100 次；倍速越高到点越快">
+          <b>等效</b><em>{{ timeVirt }}</em> / 15:00
+        </span>
         <span class="audio-state" :class="audioChipCls" :title="audioChipTitle">
           <i></i>{{ audioChipText }}
         </span>
@@ -864,14 +902,14 @@ if (AUDIO_DEBUG) {
             class="range"
             type="range"
             min="0.25"
-            max="4"
+            max="10"
             step="0.25"
             v-model.number="speedScale"
-            title="整体缩放运动节奏，不改变内外层的 127:100 周期比例"
+            title="整体缩放运动节奏，不改变内外层的 127:100 周期比例；最高 ×10"
           />
           <output>×{{ speedScale }}</output>
         </div>
-        <small>周期规律：最内层每 900s 往返 127 次 → 最外层 100 次（按层线性过渡，内快外慢）</small>
+        <small>周期规律：最内层每 900s 往返 127 次 → 最外层 100 次（按层线性过渡，内快外慢）；倍速整体缩放节奏</small>
       </div>
     </section>
   </div>
@@ -916,6 +954,28 @@ if (AUDIO_DEBUG) {
   align-items: center;
   flex-wrap: wrap;
   justify-content: flex-end;
+}
+.clock-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 12px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(56, 189, 248, 0.28);
+  background: rgba(15, 23, 42, 0.55);
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.clock-chip b {
+  color: var(--text-3);
+  font-weight: 500;
+}
+.clock-chip em {
+  color: #7dd3fc;
+  font-style: normal;
+  font-weight: 600;
 }
 .audio-state {
   display: inline-flex;
