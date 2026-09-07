@@ -42,6 +42,11 @@ const playing = ref(false)        // 是否播放
 const muted = ref(false)          // 是否静音（默认有声）
 const availR = ref(0)             // 当前画布可用半径（自动适配窗口）
 
+// 音频解锁状态：idle | starting | ready | blocked | unsupported
+const audioState = ref('idle')
+const audioNotice = ref('')
+const blockedClicks = ref(0)   // 连续几次在“用户手势”内解锁失败（用于给出逐步指引）
+
 const canvasRef = ref(null)
 const stageRef = ref(null)
 
@@ -56,10 +61,19 @@ const sim = {
   ripples: [],     // 触线反弹时的冲击波纹
 }
 
-// Web Audio：音频上下文按需惰性创建（需在用户手势中启动）
+// Web Audio：音频上下文必须由“用户手势”启动（浏览器自动播放策略）。
+// 创建成功 ≠ 能出声：被策略拦截时 state 停留在 suspended，需反复在用户手势中重试解锁。
+const AUDIO_DEBUG = typeof location !== 'undefined' && /[?&]debug(?:=|&|$)/.test(location.search)
 let audioCtx = null
 let masterGain = null
 let noiseBuffer = null
+let resumePromise = null
+let audioRetryTimer = 0
+let lastResumeProbe = 0
+let pendingNotes = []    // 解锁前发生的碰撞音先入队，解锁成功后补发
+let noticeTimer = 0
+// 调试计数器（URL 加 ?debug 后注入 window.__simAudio，便于定位问题）
+const audioStats = { builds: 0, unlockCalls: 0, collisions: 0, noteAttempts: 0, notesScheduled: 0, notesFlushed: 0 }
 
 let rafId = 0
 let lastTs = 0
@@ -149,7 +163,7 @@ function stepCount(delta) {
 
 function reset() {
   playing.value = false
-  ensureAudio() // 空格 R 等用户手势内解锁音频
+  unlockAudio() // 空格 R 等用户手势内解锁音频
   sim.ripples.length = 0
   sim.dots.forEach((p) => {
     p.pos = p.L
@@ -160,21 +174,32 @@ function reset() {
 
 function togglePlay() {
   playing.value = !playing.value
-  ensureAudio() // 播放按钮是用户手势，需借此启动 AudioContext
+  unlockAudio() // 播放按钮是用户手势，借此创建并恢复 AudioContext
 }
 
 function toggleMute() {
   muted.value = !muted.value
-  ensureAudio()
+  unlockAudio()
+  flashNotice(muted.value ? '声音已关闭（静音）' : '声音已开启', 1400)
 }
 
-/* ---------- 音频（碰撞音效） ---------- */
-function ensureAudio() {
-  if (!audioCtx) {
-    // 现代浏览器均支持标准 AudioContext（旧 Safari 亦可从窗口读取 webkitAudioContext）
-    const AC = window.AudioContext
-    if (!AC) return
+/* ---------- 音频（碰撞音效，Web Audio 实时合成，无外部资源） ---------- */
+function buildAudioGraph() {
+  // closed（浏览器已关闭/异常结束的旧上下文）必须丢弃重建，否则永久无法出声
+  if (audioCtx && audioCtx.state !== 'closed') return true
+  if (audioCtx) {
+    audioCtx = null
+    masterGain = null
+    noiseBuffer = null
+  }
+  const AC = window.AudioContext || window['webkitAudioContext']
+  if (!AC) {
+    audioState.value = 'unsupported'
+    return false
+  }
+  try {
     audioCtx = new AC()
+    audioCtx.addEventListener('statechange', onAudioStateChange)
 
     // 总线：音量 + 软限幅，防止多个音同时碰撞时削波
     masterGain = audioCtx.createGain()
@@ -193,8 +218,82 @@ function ensureAudio() {
     noiseBuffer = audioCtx.createBuffer(1, len, audioCtx.sampleRate)
     const data = noiseBuffer.getChannelData(0)
     for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1
+
+    audioStats.builds++
+  } catch (err) {
+    console.warn('WebAudio 初始化失败', err)
+    try { audioCtx && audioCtx.close() } catch (e) {}
+    audioCtx = null
+    masterGain = null
+    noiseBuffer = null
+    audioState.value = 'blocked'
+    return false
   }
-  if (audioCtx.state === 'suspended') audioCtx.resume()
+  return true
+}
+
+function onAudioStateChange() {
+  if (!audioCtx) return
+  if (audioCtx.state === 'running') {
+    audioState.value = 'ready'
+    blockedClicks.value = 0
+    flushPending()
+    if (audioRetryTimer) {
+      clearTimeout(audioRetryTimer)
+      audioRetryTimer = 0
+    }
+  }
+}
+
+// 必须在“用户手势”（点击/按键）内调用才能绕过自动播放策略。
+// 被拦截时 ctx 保持 suspended，resume() 被拒 → 置为 blocked 并定时重试，
+// 用户一旦获得 sticky activation，后续 resume 即可成功。
+function unlockAudio() {
+  if (!buildAudioGraph()) return Promise.resolve(false)
+  audioStats.unlockCalls++
+  if (audioCtx.state === 'running') {
+    audioState.value = 'ready'
+    return Promise.resolve(true)
+  }
+  if (audioCtx.state === 'suspended' && !resumePromise) {
+    audioState.value = 'starting'
+    resumePromise = audioCtx.resume().then(
+      () => {
+        resumePromise = null
+        return !!(audioCtx && audioCtx.state === 'running')
+      },
+      () => {
+        resumePromise = null
+        audioState.value = 'blocked'
+        scheduleRetry()
+        return false
+      }
+    )
+  }
+  return resumePromise || Promise.resolve(false)
+}
+
+function scheduleRetry() {
+  if (audioRetryTimer) return
+  audioRetryTimer = setTimeout(() => {
+    audioRetryTimer = 0
+    if (audioCtx && audioCtx.state === 'suspended') unlockAudio()
+  }, 900)
+}
+
+function flashNotice(text, ms = 2600) {
+  audioNotice.value = text
+  clearTimeout(noticeTimer)
+  noticeTimer = setTimeout(() => (audioNotice.value = ''), ms)
+}
+
+// 解锁成功后补发之前被拦截的碰撞音
+function flushPending() {
+  if (!pendingNotes.length || !audioCtx || audioCtx.state !== 'running') return
+  const batch = pendingNotes.splice(0)
+  for (const item of batch) {
+    try { if (scheduleNoteNow(item.index)) audioStats.notesFlushed++ } catch (e) {}
+  }
 }
 
 // 弹奏单个音调（指数衰减，类似木琴/钟琴）
@@ -218,7 +317,7 @@ function strike(freq, t0, type, peak, decay) {
 
 // 撞击瞬态（短促带通噪声，模拟“触碰直线”的物理感）
 function noiseHit(t0, dur) {
-  if (!noiseBuffer) return
+  if (!noiseBuffer || !masterGain) return
   const src = audioCtx.createBufferSource()
   src.buffer = noiseBuffer
   const filter = audioCtx.createBiquadFilter()
@@ -226,7 +325,8 @@ function noiseHit(t0, dur) {
   filter.frequency.value = 2600
   filter.Q.value = 0.8
   const g = audioCtx.createGain()
-  g.gain.setValueAtTime(0.55, t0)
+  g.gain.setValueAtTime(0.0001, t0)
+  g.gain.exponentialRampToValueAtTime(0.45, t0 + 0.005)
   g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur)
   src.connect(filter)
   filter.connect(g)
@@ -240,20 +340,114 @@ function noiseHit(t0, dur) {
   }
 }
 
-// 第 index 个点（距原点由近及远，0 起）触线时发声：
-// 音高 = do re mi fa sol la si 循环，每超过 7 个升一个八度
-function playCollisionNote(index) {
-  if (!audioCtx || muted.value) return
+// 真正调度音符：仅在 ctx 处于 running 且未静音时执行
+function scheduleNoteNow(index) {
+  if (muted.value || !audioCtx || !masterGain || audioCtx.state !== 'running') return false
   const t0 = audioCtx.currentTime
   const semi = index % 7
   const oct = Math.floor(index / 7)
   const f = NOTE_FREQS[semi] * Math.pow(2, oct)
-
-  noiseHit(t0, 0.03)                   // 物理撞击瞬态
-  strike(f, t0, 'sine', 0.34, 0.55)    // 基音
-  strike(f * 2.01, t0, 'sine', 0.1, 0.22) // 八度泛音“叮”
-  strike(f * 4.07, t0, 'sine', 0.05, 0.09) // 高频亮色
+  try {
+    noiseHit(t0, 0.035)                  // 物理撞击瞬态
+    strike(f, t0, 'sine', 0.5, 0.9)      // 基音（较长、更易被听到）
+    strike(f * 2.01, t0, 'sine', 0.12, 0.28) // 八度泛音“叮”
+    strike(f * 4.07, t0, 'sine', 0.06, 0.1)  // 高频亮色
+    audioStats.notesScheduled++
+    return true
+  } catch (err) {
+    console.warn('音符调度失败', err)
+    return false
+  }
 }
+
+// 第 index 个点（距原点由近及远，0 起）触线时发声：
+// 音高 = do re mi fa sol la si 循环，每超过 7 个升一个八度。
+// ctx 尚未 running（首次交互未解锁/被策略拦截）时不丢弃：入队等解锁补发。
+function playCollisionNote(index) {
+  audioStats.noteAttempts++
+  if (muted.value) return
+  if (audioCtx && audioCtx.state === 'running') {
+    scheduleNoteNow(index)
+    return
+  }
+  if (buildAudioGraph()) {
+    if (pendingNotes.length < 32) pendingNotes.push({ index })
+    unlockAudio()
+  }
+}
+
+// “试听”按钮：用户手势内解锁并立即弹一个 Do，用于验证声音链路
+async function testSound() {
+  if (muted.value) {
+    flashNotice('已静音：请先点击“音效开/静音”开启声音', 2400)
+    return
+  }
+  const ok = await unlockAudio()
+  if (audioState.value === 'unsupported') {
+    flashNotice('当前浏览器不支持 Web Audio，无法发声', 3800)
+    return
+  }
+  if (!ok || (audioCtx && audioCtx.state !== 'running')) {
+    blockedClicks.value++
+    if (blockedClicks.value >= 2) {
+      flashNotice('浏览器一直拦截本站声音：请点地址栏左侧图标→将本站设为“允许声音”，或在新标签页打开本页后重试', 5200)
+    } else {
+      flashNotice('音频被浏览器拦截：本次点击即是解锁动作，请再点一次“试听”', 3600)
+    }
+    return
+  }
+  blockedClicks.value = 0
+  const played = scheduleNoteNow(0)
+  flashNotice(
+    played
+      ? '已播放 Do 试听音；若仍听不到：①检查系统音量/耳机 ②看标签页是否有“喇叭×”静音 ③确认非静音状态'
+      : '试听调度失败：请检查系统音量与输出设备',
+    4600
+  )
+}
+
+function audioSupervisor() {
+  // ctx 被策略拦截(suspended)时周期重试；异常关闭(closed)时重建
+  if (!audioCtx) return
+  if (audioCtx.state === 'closed') {
+    buildAudioGraph()
+    return
+  }
+  if (audioCtx.state === 'suspended') {
+    const now = performance.now()
+    if (now - lastResumeProbe > 1000) {
+      lastResumeProbe = now
+      unlockAudio()
+    }
+  }
+}
+
+const audioChipText = computed(() => {
+  if (audioNotice.value) return audioNotice.value
+  switch (audioState.value) {
+    case 'idle': return '音频：待启动'
+    case 'starting': return '音频：解锁中…'
+    case 'ready': return muted.value ? '音频：就绪 · 已静音' : '音频：就绪'
+    case 'blocked': return '⚠ 音频被浏览器拦截'
+    case 'unsupported': return '⚠ 不支持 Web Audio'
+    default: return '音频：未知状态'
+  }
+})
+const audioChipCls = computed(() => {
+  if (audioNotice.value) return 'notice'
+  return audioState.value === 'ready'
+    ? muted.value ? 'ok muted' : 'ok'
+    : 'warn'
+})
+const audioChipTitle = computed(() => {
+  if (audioState.value === 'blocked') {
+    return '浏览器自动播放策略拦截了本站音频。请连续点击“试听”按钮 1~2 次（点击本身即解锁动作）；若仍失败，请点击地址栏左侧图标，将本站设为“允许声音”，或在新标签页打开本页后重试'
+  }
+  if (audioState.value === 'ready') {
+    return '音频已就绪：Web Audio 实时合成（无外部文件），主音量 0.6 非零；若点击试听后仍听不到，请检查系统音量/输出设备/浏览器标签页是否被静音'
+  }
+  return '碰撞音效由 Web Audio 实时合成，无需外部音频文件；首次使用请点击“试听”或“播放”解锁'
+})
 
 /* ---------- 运动物理 ---------- */
 function impactAtEnd(p, index) {
@@ -262,6 +456,7 @@ function impactAtEnd(p, index) {
   const sideX = p.pos <= 0 ? sim.cx + p.d : sim.cx - p.d // 触地点（直线另一端）
   sim.ripples.push({ x: sideX, y: sim.cy, age: 0 })
   if (sim.ripples.length > 24) sim.ripples.shift()
+  audioStats.collisions++
   playCollisionNote(index) // 对应音符：距原点最近的=Do，向外依次升调
 }
 
@@ -473,7 +668,13 @@ function tick(ts) {
   const dt = lastTs ? Math.min(Math.max((ts - lastTs) / 1000, 0), MAX_FRAME) : 0
   lastTs = ts
   if (playing.value) update(dt)
+  audioSupervisor()
   render()
+}
+
+// 任意用户手势（点击/按键）都可能携带可解锁音频的“激活”，捕获它们尽早解锁
+function onUserGesture() {
+  unlockAudio()
 }
 
 function onKeydown(e) {
@@ -495,12 +696,19 @@ onMounted(() => {
   resizeObserver = new ResizeObserver(() => layout())
   resizeObserver.observe(stageRef.value)
   window.addEventListener('keydown', onKeydown)
+  // 捕获任意首次用户手势（点击画布/控件/空白处），尽早创建并解锁音频
+  window.addEventListener('pointerdown', onUserGesture, { passive: true })
+  window.addEventListener('keydown', onUserGesture)
 })
 
 onBeforeUnmount(() => {
   cancelAnimationFrame(rafId)
   resizeObserver && resizeObserver.disconnect()
   window.removeEventListener('keydown', onKeydown)
+  window.removeEventListener('pointerdown', onUserGesture)
+  window.removeEventListener('keydown', onUserGesture)
+  clearTimeout(audioRetryTimer)
+  clearTimeout(noticeTimer)
   if (audioCtx && audioCtx.state !== 'closed') {
     audioCtx.close().catch(() => {})
     audioCtx = null
@@ -508,6 +716,19 @@ onBeforeUnmount(() => {
     noiseBuffer = null
   }
 })
+
+// URL 携带 ?debug 时暴露内部状态，便于排查碰撞触发与音频链路
+if (AUDIO_DEBUG) {
+  window.__simAudio = {
+    get ctxState() { return audioCtx ? audioCtx.state : 'none' },
+    get audioState() { return audioState.value },
+    get muted() { return muted.value },
+    get pending() { return pendingNotes.length },
+    get playing() { return playing.value },
+    stats: audioStats,
+    unlock: () => unlockAudio(),
+  }
+}
 </script>
 
 <template>
@@ -518,6 +739,9 @@ onBeforeUnmount(() => {
         <p class="sub">多个点沿各自上方半圆路径匀速往返，触线反弹并发声；距原点由近及远依次为 Do Re Mi Fa Sol La Si，超 7 点后升八度循环</p>
       </div>
       <div class="header-actions">
+        <span class="audio-state" :class="audioChipCls" :title="audioChipTitle">
+          <i></i>{{ audioChipText }}
+        </span>
         <button class="btn ghost" @click="reset" title="重置 (R)">
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M3 12a9 9 0 1 0 3-6.7" />
@@ -542,6 +766,14 @@ onBeforeUnmount(() => {
             <path d="M18.5 5.5a9 9 0 0 1 0 13" />
           </svg>
           {{ muted ? '已静音' : '音效开' }}
+        </button>
+        <button class="btn ghost" @click="testSound" title="立即播放一个 Do 音，用于验证声音并解锁浏览器限制">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 18V5l12-2v13" />
+            <circle cx="6" cy="18" r="3" />
+            <circle cx="18" cy="16" r="3" />
+          </svg>
+          试听
         </button>
         <button class="btn play" :class="{ paused: !playing }" @click="togglePlay" title="播放/暂停 (空格)">
           <svg v-if="playing" viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
@@ -667,6 +899,55 @@ onBeforeUnmount(() => {
   display: flex;
   gap: 10px;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.audio-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(15, 23, 42, 0.55);
+  color: var(--text-2);
+  max-width: 260px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.audio-state i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-3);
+  flex: none;
+}
+.audio-state.ok {
+  border-color: rgba(74, 222, 128, 0.35);
+}
+.audio-state.ok i {
+  background: #4ade80;
+  box-shadow: 0 0 6px rgba(74, 222, 128, 0.8);
+}
+.audio-state.ok.muted i {
+  background: #fbbf24;
+  box-shadow: none;
+}
+.audio-state.warn {
+  border-color: rgba(251, 191, 36, 0.4);
+  color: #fcd34d;
+}
+.audio-state.warn i {
+  background: #fbbf24;
+}
+.audio-state.notice {
+  border-color: rgba(56, 189, 248, 0.4);
+  color: #7dd3fc;
+}
+.audio-state.notice i {
+  background: #38bdf8;
 }
 .btn {
   display: inline-flex;
