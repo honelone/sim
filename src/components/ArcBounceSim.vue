@@ -502,19 +502,23 @@ function update(dt) {
     // 线速度 v = 路程 / 周期 = 2L·cycles / CYCLE_PERIOD，再乘演示倍速
     const cycles = CYCLE_INNER - step * i
     const v = ((2 * p.L * cycles) / CYCLE_PERIOD) * scale
-    let pos = p.pos + p.dir * v * dt
-    if (p.dir < 0 && pos <= 0) {
-      // 到达右端点（另一端触线）
-      p.pos = 0
-      p.dir = 1
-      impactAtEnd(p, i)
-    } else if (p.dir > 0 && pos >= p.L) {
-      // 到达左端点（原路另一侧触线）
-      p.pos = p.L
-      p.dir = -1
-      impactAtEnd(p, i)
-    } else {
-      p.pos = pos
+    // 事件式精确积分：本帧位移在端点处精确反弹，并把“越过端点的剩余位移”
+    // 反向继续带走（而不是截断丢弃）。否则每撞击一次平均丢失半帧行程，
+    // 会使各层实际频率略高于标称、内外层漂移量不同，第 900s 无法同步回位成一条直线。
+    let remain = v * dt
+    let guard = 0
+    while (remain > 1e-9 && guard < 16) {
+      const toEnd = p.dir < 0 ? p.pos : p.L - p.pos
+      if (remain <= toEnd) {
+        p.pos += p.dir * remain
+        remain = 0
+      } else {
+        p.pos = p.dir < 0 ? 0 : p.L // 触线端点（右/左）
+        remain -= toEnd
+        p.dir *= -1
+        impactAtEnd(p, i)
+      }
+      guard++
     }
     if (p.bounce >= 0) {
       p.bounce += dt
