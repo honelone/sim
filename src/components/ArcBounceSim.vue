@@ -10,7 +10,8 @@ import { onMounted, onBeforeUnmount, ref, watch, computed } from 'vue'
  *  5. 相邻点间距存在 [SPACING_MIN, SPACING_MAX] 约束
  *  6. 以“点到原点的距离”为半径，画上方半圆弧路径（颜色比直线淡）
  *  7. 播放按钮：点击后点开始运动
- *  8. 所有点沿线做匀速运动（角速度不同但线速度相同）
+ *  8. 各层按“周期”定速：最内层点每 900s 往返 127 次，最外层往返 100 次，
+ *     中间各层按序号线性过渡（内快外慢）
  *  9. 从直线一端绕半圆到另一端后原路返回，无限循环
  * 10. 到达端点触线时做弹性压缩/回弹的物理反弹动画
  * 11. 绘制“点与原点”之间的连线，颜色比半圆路径更淡
@@ -29,15 +30,21 @@ const DOT_R = 6                   // 运动点半径
 const LINE_Y_RATIO = 0.58         // 直线在画布高度上的比例位置
 const ARC_ALPHA = 0.3             // 半圆路径不透明度
 const CONNECT_ALPHA = 0.13        // “点-原点”连线不透明度（须小于 ARC_ALPHA）
+
+// 周期运动规则：最内层点每 CYCLE_PERIOD 秒往返 CYCLE_INNER 次，最外层往返 CYCLE_OUTER 次，
+// 中间各层按序号线性过渡（往返 1 次 = 沿上方半圆从左到右再回到左）
+const CYCLE_PERIOD = 900          // 统计周期秒数
+const CYCLE_INNER = 127           // 最内层（距原点最近）每 900s 的往返次数
+const CYCLE_OUTER = 100           // 最外层（距原点最远）每 900s 的往返次数
 const MAX_FRAME = 0.05            // 单帧最大 dt 秒（防止后台切回跳变）
 
 // 音阶（自然大调 do re mi fa sol la si = C4 D4 E4 F4 G4 A4 B4）
 const NOTE_FREQS = [261.63, 293.66, 329.63, 349.23, 392.0, 440.0, 493.88]
 
 /* ---------- 交互状态（响应式） ---------- */
-const countInput = ref(5)         // 用户输入的点数量
-const spacingVal = ref(64)        // 用户期望的间距
-const speedVal = ref(260)         // 匀速运动的线速度 px/s
+const countInput = ref(28)         // 用户输入的点数量（默认 28，可自由增减）
+const spacingVal = ref(64)         // 用户期望的间距
+const speedScale = ref(1)          // 演示倍速：整体缩放周期节奏，不影响内外层比例
 const playing = ref(false)        // 是否播放
 const muted = ref(false)          // 是否静音（默认有声）
 const availR = ref(0)             // 当前画布可用半径（自动适配窗口）
@@ -461,9 +468,16 @@ function impactAtEnd(p, index) {
 }
 
 function update(dt) {
-  const v = Number(speedVal.value) || 260
-  for (let i = 0; i < sim.dots.length; i++) {
+  const scale = Number(speedScale.value) || 1
+  // 往返次数按层线性过渡：i=0(最内层)=CYCLE_INNER … 最外层=CYCLE_OUTER
+  const n = sim.dots.length
+  const step = n > 1 ? (CYCLE_INNER - CYCLE_OUTER) / (n - 1) : 0
+  for (let i = 0; i < n; i++) {
     const p = sim.dots[i]
+    // 往返一次路程 = 2·L(半圆弧长)；周期时间 = CYCLE_PERIOD / 往返次数
+    // 线速度 v = 路程 / 周期 = 2L·cycles / CYCLE_PERIOD，再乘演示倍速
+    const cycles = CYCLE_INNER - step * i
+    const v = ((2 * p.L * cycles) / CYCLE_PERIOD) * scale
     let pos = p.pos + p.dir * v * dt
     if (p.dir < 0 && pos <= 0) {
       // 到达右端点（另一端触线）
@@ -736,7 +750,7 @@ if (AUDIO_DEBUG) {
     <header class="sim-header">
       <div>
         <h1>半圆往返 · 弹性反弹 · 音阶碰撞</h1>
-        <p class="sub">多个点沿各自上方半圆路径匀速往返，触线反弹并发声；距原点由近及远依次为 Do Re Mi Fa Sol La Si，超 7 点后升八度循环</p>
+        <p class="sub">默认 28 个点，沿各自上方半圆路径往返，触线反弹并发声；最内层每 900s 往返 127 次、最外层 100 次（内快外慢）；音高按距原点由近及远为 Do Re Mi Fa Sol La Si，超 7 点升八度循环</p>
       </div>
       <div class="header-actions">
         <span class="audio-state" :class="audioChipCls" :title="audioChipTitle">
@@ -844,19 +858,20 @@ if (AUDIO_DEBUG) {
       </div>
 
       <div class="pgroup grow">
-        <span class="plabel">运动速度</span>
+        <span class="plabel">演示倍速</span>
         <div class="range-row">
           <input
             class="range"
             type="range"
-            min="40"
-            max="600"
-            step="10"
-            v-model.number="speedVal"
+            min="0.25"
+            max="4"
+            step="0.25"
+            v-model.number="speedScale"
+            title="整体缩放运动节奏，不改变内外层的 127:100 周期比例"
           />
-          <output>{{ speedVal }} px/s</output>
+          <output>×{{ speedScale }}</output>
         </div>
-        <small>所有点保持同一线速度（各点弧长不同，角速度相应不同）</small>
+        <small>周期规律：最内层每 900s 往返 127 次 → 最外层 100 次（按层线性过渡，内快外慢）</small>
       </div>
     </section>
   </div>
