@@ -13,23 +13,33 @@ import { onMounted, onBeforeUnmount, ref, watch, computed } from 'vue'
  *  8. 所有点沿线做匀速运动（角速度不同但线速度相同）
  *  9. 从直线一端绕半圆到另一端后原路返回，无限循环
  * 10. 到达端点触线时做弹性压缩/回弹的物理反弹动画
+ * 11. 绘制“点与原点”之间的连线，颜色比半圆路径更淡
+ * 12. 点触线时发声：按“距原点由近及远”固定分配音高，
+ *     do re mi fa sol la si → 超过 7 个则升一个八度继续重复
  * ========================================================= */
 
 /* ---------- 常量 ---------- */
-const SPACING_MIN = 28            // 相邻点间距下限 px
-const SPACING_MAX = 140           // 相邻点间距上限 px
+const SPACING_MIN = 20            // 相邻点间距 slider 手动下限 px
+const SPACING_MAX = 140           // 相邻点间距 slider 手动上限 px
+const ABS_MIN_SPACING = 10        // 点较多时自动收缩间距的绝对下限 px
+const MAX_DOTS = 40               // 数量的绝对 UI 上限
 const LINE_WIDTH = 3              // 主直线宽度 px
 const ORIGIN_R = 7                // 原点半径（> 直线宽度）
 const DOT_R = 6                   // 运动点半径
 const LINE_Y_RATIO = 0.58         // 直线在画布高度上的比例位置
 const ARC_ALPHA = 0.3             // 半圆路径不透明度
+const CONNECT_ALPHA = 0.13        // “点-原点”连线不透明度（须小于 ARC_ALPHA）
 const MAX_FRAME = 0.05            // 单帧最大 dt 秒（防止后台切回跳变）
+
+// 音阶（自然大调 do re mi fa sol la si = C4 D4 E4 F4 G4 A4 B4）
+const NOTE_FREQS = [261.63, 293.66, 329.63, 349.23, 392.0, 440.0, 493.88]
 
 /* ---------- 交互状态（响应式） ---------- */
 const countInput = ref(5)         // 用户输入的点数量
 const spacingVal = ref(64)        // 用户期望的间距
 const speedVal = ref(260)         // 匀速运动的线速度 px/s
 const playing = ref(false)        // 是否播放
+const muted = ref(false)          // 是否静音（默认有声）
 const availR = ref(0)             // 当前画布可用半径（自动适配窗口）
 
 const canvasRef = ref(null)
@@ -42,18 +52,24 @@ const sim = {
   dpr: 1,
   cx: 0,
   cy: 0,
-  dots: [],        // 每个运动点: { d, L, pos, dir, bounce }
+  dots: [],        // 每个运动点: { d, L, pos, dir, bounce }，数组序=距原点由近及远
   ripples: [],     // 触线反弹时的冲击波纹
 }
+
+// Web Audio：音频上下文按需惰性创建（需在用户手势中启动）
+let audioCtx = null
+let masterGain = null
+let noiseBuffer = null
 
 let rafId = 0
 let lastTs = 0
 let resizeObserver = null
 
 /* ---------- 约束推导（供 UI 展示） ---------- */
+// 数量上限 = 可用半径内按绝对最小间距能摆放的最大点数（另设 UI 硬顶）
 const maxCount = computed(() => {
-  if (availR.value <= 0) return 20
-  return Math.max(1, Math.floor(availR.value / SPACING_MIN))
+  if (availR.value <= 0) return MAX_DOTS
+  return Math.min(MAX_DOTS, Math.max(1, Math.floor(availR.value / ABS_MIN_SPACING)))
 })
 
 const effCount = computed(() => {
@@ -64,15 +80,20 @@ const effCount = computed(() => {
 const effSpacing = computed(() => {
   const n = effCount.value
   const cap = availR.value > 0 ? availR.value / n : SPACING_MAX
-  return Math.min(Math.max(spacingVal.value, SPACING_MIN), Math.min(SPACING_MAX, cap))
+  // 点少时尊重用户手动间距；点多放不下时自动压缩到空间允许值（下限 ABS_MIN_SPACING）
+  return Math.min(Math.max(spacingVal.value, SPACING_MIN), Math.min(SPACING_MAX, Math.max(cap, ABS_MIN_SPACING)))
 })
 
 const spacingLabel = computed(() => Math.round(effSpacing.value))
 const outerLabel = computed(() => Math.round(effSpacing.value * effCount.value))
 
 const spacingHint = computed(() => {
-  const allow = Math.round(Math.min(SPACING_MAX, availR.value > 0 ? availR.value / effCount.value : SPACING_MAX))
-  return `允许范围 ${SPACING_MIN} ~ ${allow}px（超出时自动收缩，保证弧线不越界）`
+  const manual = `手动范围 ${SPACING_MIN} ~ ${SPACING_MAX}px`
+  const auto =
+    effCount.value > 0 && availR.value / effCount.value < SPACING_MIN
+      ? `；当前 ${effCount.value} 个点已超出手动下限，已自动压缩至 ${Math.max(Math.round(availR.value / effCount.value), ABS_MIN_SPACING)}px`
+      : ''
+  return `${manual}${auto}（空间不足时自动收缩，保证弧线不越界）`
 })
 
 /* ---------- 画布几何与点列重建 ---------- */
@@ -93,8 +114,8 @@ function layout() {
   sim.cx = w / 2
   sim.cy = h * LINE_Y_RATIO
 
-  // 可用半径 = 水平可用一半 与 竖直可用高度 的较小值，并留边
-  availR.value = Math.max(42, Math.min(w / 2 - 110, sim.cy - 120))
+  // 可用半径 = 水平可用一半（左右各留 60px）与 竖直可用高度（弧顶避开左上角徽章）的较小值
+  availR.value = Math.max(50, Math.min(w / 2 - 60, sim.cy - 64))
 
   // 数量自动回落到当前画布可容纳范围
   const c = Math.min(Math.max(1, Math.round(Number(countInput.value) || 1)), maxCount.value)
@@ -128,6 +149,7 @@ function stepCount(delta) {
 
 function reset() {
   playing.value = false
+  ensureAudio() // 空格 R 等用户手势内解锁音频
   sim.ripples.length = 0
   sim.dots.forEach((p) => {
     p.pos = p.L
@@ -138,31 +160,126 @@ function reset() {
 
 function togglePlay() {
   playing.value = !playing.value
+  ensureAudio() // 播放按钮是用户手势，需借此启动 AudioContext
+}
+
+function toggleMute() {
+  muted.value = !muted.value
+  ensureAudio()
+}
+
+/* ---------- 音频（碰撞音效） ---------- */
+function ensureAudio() {
+  if (!audioCtx) {
+    // 现代浏览器均支持标准 AudioContext（旧 Safari 亦可从窗口读取 webkitAudioContext）
+    const AC = window.AudioContext
+    if (!AC) return
+    audioCtx = new AC()
+
+    // 总线：音量 + 软限幅，防止多个音同时碰撞时削波
+    masterGain = audioCtx.createGain()
+    masterGain.gain.value = 0.6
+    const comp = audioCtx.createDynamicsCompressor()
+    comp.threshold.value = -14
+    comp.knee.value = 18
+    comp.ratio.value = 8
+    comp.attack.value = 0.003
+    comp.release.value = 0.25
+    masterGain.connect(comp)
+    comp.connect(audioCtx.destination)
+
+    // 预生成 60ms 白噪声缓冲，供“撞击瞬态”复用
+    const len = Math.floor(audioCtx.sampleRate * 0.06)
+    noiseBuffer = audioCtx.createBuffer(1, len, audioCtx.sampleRate)
+    const data = noiseBuffer.getChannelData(0)
+    for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume()
+}
+
+// 弹奏单个音调（指数衰减，类似木琴/钟琴）
+function strike(freq, t0, type, peak, decay) {
+  const osc = audioCtx.createOscillator()
+  const g = audioCtx.createGain()
+  osc.type = type
+  osc.frequency.value = freq
+  g.gain.setValueAtTime(0.0001, t0)
+  g.gain.exponentialRampToValueAtTime(peak, t0 + 0.005)
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + decay)
+  osc.connect(g)
+  g.connect(masterGain)
+  osc.start(t0)
+  osc.stop(t0 + decay + 0.05)
+  osc.onended = () => {
+    osc.disconnect()
+    g.disconnect()
+  }
+}
+
+// 撞击瞬态（短促带通噪声，模拟“触碰直线”的物理感）
+function noiseHit(t0, dur) {
+  if (!noiseBuffer) return
+  const src = audioCtx.createBufferSource()
+  src.buffer = noiseBuffer
+  const filter = audioCtx.createBiquadFilter()
+  filter.type = 'bandpass'
+  filter.frequency.value = 2600
+  filter.Q.value = 0.8
+  const g = audioCtx.createGain()
+  g.gain.setValueAtTime(0.55, t0)
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur)
+  src.connect(filter)
+  filter.connect(g)
+  g.connect(masterGain)
+  src.start(t0)
+  src.stop(t0 + dur + 0.02)
+  src.onended = () => {
+    src.disconnect()
+    filter.disconnect()
+    g.disconnect()
+  }
+}
+
+// 第 index 个点（距原点由近及远，0 起）触线时发声：
+// 音高 = do re mi fa sol la si 循环，每超过 7 个升一个八度
+function playCollisionNote(index) {
+  if (!audioCtx || muted.value) return
+  const t0 = audioCtx.currentTime
+  const semi = index % 7
+  const oct = Math.floor(index / 7)
+  const f = NOTE_FREQS[semi] * Math.pow(2, oct)
+
+  noiseHit(t0, 0.03)                   // 物理撞击瞬态
+  strike(f, t0, 'sine', 0.34, 0.55)    // 基音
+  strike(f * 2.01, t0, 'sine', 0.1, 0.22) // 八度泛音“叮”
+  strike(f * 4.07, t0, 'sine', 0.05, 0.09) // 高频亮色
 }
 
 /* ---------- 运动物理 ---------- */
-function impactAtEnd(p) {
+function impactAtEnd(p, index) {
   // 触线反弹：标记冲击时刻（用于绘制弹性压缩/回弹）
   p.bounce = 0
   const sideX = p.pos <= 0 ? sim.cx + p.d : sim.cx - p.d // 触地点（直线另一端）
   sim.ripples.push({ x: sideX, y: sim.cy, age: 0 })
   if (sim.ripples.length > 24) sim.ripples.shift()
+  playCollisionNote(index) // 对应音符：距原点最近的=Do，向外依次升调
 }
 
 function update(dt) {
   const v = Number(speedVal.value) || 260
-  for (const p of sim.dots) {
+  for (let i = 0; i < sim.dots.length; i++) {
+    const p = sim.dots[i]
     let pos = p.pos + p.dir * v * dt
     if (p.dir < 0 && pos <= 0) {
       // 到达右端点（另一端触线）
       p.pos = 0
       p.dir = 1
-      impactAtEnd(p)
+      impactAtEnd(p, i)
     } else if (p.dir > 0 && pos >= p.L) {
       // 到达左端点（原路另一侧触线）
       p.pos = p.L
       p.dir = -1
-      impactAtEnd(p)
+      impactAtEnd(p, i)
     } else {
       p.pos = pos
     }
@@ -188,6 +305,7 @@ function render() {
   drawCenterGuide(ctx)
   drawMainLine(ctx)
   drawArcPaths(ctx)
+  drawConnectors(ctx)
   drawRipples(ctx)
   drawDots(ctx)
   drawOrigin(ctx)
@@ -240,6 +358,24 @@ function drawArcPaths(ctx) {
     ctx.arc(sim.cx, sim.cy, p.d, Math.PI, Math.PI * 2, false)
     ctx.strokeStyle = `rgba(103,232,249,${ARC_ALPHA})` // 颜色显著淡于主直线
     ctx.lineWidth = 2
+    ctx.stroke()
+  }
+  ctx.restore()
+}
+
+// 点与原点之间的连线：不透明度低于半圆路径（CONNECT_ALPHA < ARC_ALPHA）
+function drawConnectors(ctx) {
+  ctx.save()
+  ctx.lineWidth = 1
+  ctx.lineCap = 'round'
+  ctx.strokeStyle = `rgba(148,210,250,${CONNECT_ALPHA})`
+  for (const p of sim.dots) {
+    const a = p.pos / p.d
+    const x = sim.cx + p.d * Math.cos(a)
+    const y = sim.cy - p.d * Math.sin(a)
+    ctx.beginPath()
+    ctx.moveTo(sim.cx, sim.cy)
+    ctx.lineTo(x, y)
     ctx.stroke()
   }
   ctx.restore()
@@ -365,6 +501,12 @@ onBeforeUnmount(() => {
   cancelAnimationFrame(rafId)
   resizeObserver && resizeObserver.disconnect()
   window.removeEventListener('keydown', onKeydown)
+  if (audioCtx && audioCtx.state !== 'closed') {
+    audioCtx.close().catch(() => {})
+    audioCtx = null
+    masterGain = null
+    noiseBuffer = null
+  }
 })
 </script>
 
@@ -372,8 +514,8 @@ onBeforeUnmount(() => {
   <div class="sim-root">
     <header class="sim-header">
       <div>
-        <h1>半圆往返 · 弹性反弹演示</h1>
-        <p class="sub">多个点沿各自上方半圆路径匀速往返，触线时产生物理反弹效果</p>
+        <h1>半圆往返 · 弹性反弹 · 音阶碰撞</h1>
+        <p class="sub">多个点沿各自上方半圆路径匀速往返，触线反弹并发声；距原点由近及远依次为 Do Re Mi Fa Sol La Si，超 7 点后升八度循环</p>
       </div>
       <div class="header-actions">
         <button class="btn ghost" @click="reset" title="重置 (R)">
@@ -382,6 +524,24 @@ onBeforeUnmount(() => {
             <path d="M3 4v5h5" />
           </svg>
           重置
+        </button>
+        <button
+          class="btn ghost sound"
+          :class="{ muted }"
+          @click="toggleMute"
+          :title="muted ? '开启碰撞音效' : '关闭碰撞音效'"
+        >
+          <svg v-if="muted" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M11 5 6 9H2v6h4l5 4V5z" />
+            <line x1="23" y1="9" x2="17" y2="15" />
+            <line x1="17" y1="9" x2="23" y2="15" />
+          </svg>
+          <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M11 5 6 9H2v6h4l5 4V5z" />
+            <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+            <path d="M18.5 5.5a9 9 0 0 1 0 13" />
+          </svg>
+          {{ muted ? '已静音' : '音效开' }}
         </button>
         <button class="btn play" :class="{ paused: !playing }" @click="togglePlay" title="播放/暂停 (空格)">
           <svg v-if="playing" viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
@@ -403,7 +563,7 @@ onBeforeUnmount(() => {
         <span class="badge" :class="{ running: playing }">
           <i></i>{{ playing ? '运动进行中' : '已暂停' }}
         </span>
-        <span class="badge">点数 n = {{ effCount }}</span>
+        <span class="badge">点数 {{ effCount }} / {{ maxCount }}</span>
         <span class="badge">实际间距 {{ spacingLabel }}px</span>
         <span class="badge">最远半径 {{ outerLabel }}px</span>
       </div>
@@ -411,6 +571,7 @@ onBeforeUnmount(() => {
       <div class="legend">
         <span class="lg"><i class="sw line"></i>基准直线</span>
         <span class="lg"><i class="sw arc"></i>半圆路径</span>
+        <span class="lg"><i class="sw conn"></i>到原点连线</span>
         <span class="lg"><i class="sw origin"></i>原点</span>
         <span class="lg"><i class="sw dot"></i>运动点</span>
       </div>
@@ -531,6 +692,13 @@ onBeforeUnmount(() => {
 .btn.ghost svg {
   color: var(--text-2);
 }
+.btn.sound.muted {
+  opacity: 0.75;
+  border-color: rgba(248, 113, 113, 0.45);
+}
+.btn.sound.muted svg {
+  color: #f87171;
+}
 .btn.play {
   border: none;
   background: linear-gradient(135deg, #0ea5e9, #22d3ee);
@@ -625,6 +793,7 @@ onBeforeUnmount(() => {
 }
 .sw.line { background: linear-gradient(90deg, rgba(125, 211, 252, 0.4), #7dd3fc); }
 .sw.arc { background: #67e8f9; opacity: 0.4; border-radius: 4px 4px 0 0; height: 10px; clip-path: none; }
+.sw.conn { background: #94d2fa; opacity: 0.16; height: 2px; width: 26px; }
 .sw.origin { background: radial-gradient(circle at 30% 30%, #fff7ed, #f59e0b); height: 10px; width: 10px; border-radius: 50%; }
 .sw.dot { background: radial-gradient(circle at 30% 30%, #fff, #0ea5e9); height: 10px; width: 10px; border-radius: 50%; }
 
