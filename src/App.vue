@@ -59,10 +59,10 @@ const page = ref('ellipse')
   overflow: hidden;
 }
 
-/* 顶部居中的页面切换器（悬浮于各页信息条之上） */
+/* 顶部居中的页面切换器（悬浮于各页总控条之上，始终顶部水平居中） */
 .page-switch {
   position: fixed;
-  top: 8px;
+  top: 6px;
   left: 50%;
   transform: translateX(-50%);
   z-index: 50;
@@ -126,12 +126,14 @@ const page = ref('ellipse')
   transform: scaleY(0.62);
 }
 
+/* 窄屏同样保持顶部水平居中，只压缩内边距与字号 */
 @media (max-width: 760px) {
   .page-switch {
     top: 6px;
-    left: auto;
-    right: 8px;
-    transform: none;
+    left: 50%;
+    transform: translateX(-50%);
+    gap: 0;
   }
+  .ps-btn { padding: 6px 9px; font-size: 11px; }
 }
 </style>

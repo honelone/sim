@@ -80,9 +80,7 @@ const blockedClicks = ref(0)
 
 const canvasRef = ref(null)
 const stageRef = ref(null)
-const headerEl = ref(null)
-const miniEl = ref(null)
-const panelEl = ref(null)
+const dockEl = ref(null)   // 顶部总控条（header + panel 合并后的一体容器）
 
 // 每个运动点的元信息（颜色 = 彩虹七色按点序循环；音符 = 七音阶按点序循环升调）
 const meta = computed(() =>
@@ -135,10 +133,6 @@ const timeVirt = ref('00:00.0')
 const seekText = ref('00:00')
 
 /* ---------- 布局：原点居中，V 形与圆弧整体位于上半区 ---------- */
-function measure(el) {
-  return el && el.getBoundingClientRect ? el.getBoundingClientRect().height : 0
-}
-
 function layout() {
   const canvas = canvasRef.value
   const stage = stageRef.value
@@ -154,11 +148,9 @@ function layout() {
   canvas.width = Math.round(w * dpr)
   canvas.height = Math.round(h * dpr)
 
-  // 顶部/底部悬浮信息条的高度（用真实 DOM 高度）
-  const headerH = headerOpen.value ? measure(headerEl.value) || 52 : measure(miniEl.value) || 42
-  const panelH = panelOpen.value ? measure(panelEl.value) || 150 : 0
-  const padT = headerH + 20
-  const padB = panelH + 24
+  // header 与 panel 已合并为顶部一条总控条：直接测量它实际遮挡的顶部高度（含与顶部的间距）
+  const padT = (dockEl.value ? dockEl.value.getBoundingClientRect().bottom - rect.top : 150) + 16
+  const padB = 24
   const regionTop = padT
   const regionBottom = Math.max(padT + 120, h - padB)
 
@@ -903,200 +895,203 @@ if (AUDIO_DEBUG) {
       <canvas ref="canvasRef" class="sim-canvas"></canvas>
     </div>
 
-    <!-- ================= 顶部：标题 + 状态/操作条（悬浮可折叠） ================= -->
-    <header v-if="headerOpen" ref="headerEl" class="sim-header">
-      <h1 title="正中原点向左右上各引一条线段（默认夹角 135°，单侧相对竖直 67.5°）；多个点沿各自半径的圆弧在两条线段间摆荡，撞线即反弹并奏响音阶">V 形扇摆 · 彩虹弧摆 · 撞线音阶</h1>
-      <div class="header-actions">
-        <span class="clock-chip" title="播放自开始/重置以来的实际流逝时间（暂停期间不计）">
-          <b>运行</b><em>{{ timeReal }}</em>
-        </span>
-        <span class="clock-chip" title="等效时间 = 实际时间 × 倍速。每 60s（等效）所有点同步回到左侧线段一次">
-          <b>等效</b><em>{{ timeVirt }}</em><span class="clock-den">/1:00</span>
-        </span>
-        <span
-          class="note-chip"
-          :class="{ lit: lastNote }"
-          title="最近一次运动点撞线时奏响的音符"
-        >
-          <i class="note-dot" :style="lastNote ? { background: lastNote.color } : null"></i>
-          <template v-if="lastNote">点{{ lastNote.num }} · {{ lastNote.name }}</template>
-          <template v-else>—</template>
-        </span>
-        <span class="seek-chip">
-          <b class="seek-label">定位</b>
-          <input
-            class="seek-input"
-            v-model="seekText"
-            inputmode="decimal"
-            spellcheck="false"
-            placeholder="mm:ss"
-            title="输入 mm:ss（如 00:30）或纯秒数（如 30），回车跳转；范围 0:00 ~ 1:00"
-            @input="seekLive"
-            @keydown.enter.prevent="applySeekInput"
-            @keydown.esc="seekText = fmtMMSS(Math.round(virtElapsed))"
-          />
-          <button class="seek-btn" title="后退 10 秒" @click="nudgeSeek(-10)">−10s</button>
-          <button class="seek-btn" title="前进 10 秒" @click="nudgeSeek(10)">+10s</button>
-          <button class="seek-btn go" title="跳转到输入的时间点" @click="applySeekInput">跳转</button>
-        </span>
-        <span class="audio-state" :class="audioChipCls" :title="audioChipTitle">
-          <i></i>{{ audioChipText }}
-        </span>
-        <button class="btn ghost sound" :class="{ muted }" @click="toggleMute" :title="muted ? '开启撞线音效' : '关闭撞线音效'">
-          <svg v-if="muted" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M11 5 6 9H2v6h4l5 4V5z" />
-            <line x1="23" y1="9" x2="17" y2="15" />
-            <line x1="17" y1="9" x2="23" y2="15" />
-          </svg>
-          <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M11 5 6 9H2v6h4l5 4V5z" />
-            <path d="M15.5 8.5a5 5 0 0 1 0 7" />
-            <path d="M18.5 5.5a9 9 0 0 1 0 13" />
-          </svg>
-          {{ muted ? '已静音' : '音效开' }}
+      <!-- ============ 顶部总控条：标题/状态/操作 + 控制/图例 合并为一条悬浮卡片 ============ -->
+      <div class="dock" ref="dockEl">
+        <!-- 第一行：标题（左） + 状态与操作（右）；中间留白，避开顶部居中的页面切换器 -->
+        <header v-if="headerOpen" class="dock-head">
+        <h1 title="正中原点向左右上各引一条线段（默认夹角 135°，单侧相对竖直 67.5°）；多个点沿各自半径的圆弧在两条线段间摆荡，撞线即反弹并奏响音阶">V 形扇摆 · 彩虹弧摆 · 撞线音阶</h1>
+        <div class="header-actions">
+          <span class="clock-chip" title="播放自开始/重置以来的实际流逝时间（暂停期间不计）">
+            <b>运行</b><em>{{ timeReal }}</em>
+          </span>
+          <span class="clock-chip" title="等效时间 = 实际时间 × 倍速。每 60s（等效）所有点同步回到左侧线段一次">
+            <b>等效</b><em>{{ timeVirt }}</em><span class="clock-den">/1:00</span>
+          </span>
+          <span
+            class="note-chip"
+            :class="{ lit: lastNote }"
+            title="最近一次运动点撞线时奏响的音符"
+          >
+            <i class="note-dot" :style="lastNote ? { background: lastNote.color } : null"></i>
+            <template v-if="lastNote">点{{ lastNote.num }} · {{ lastNote.name }}</template>
+            <template v-else>—</template>
+          </span>
+          <span class="seek-chip">
+            <b class="seek-label">定位</b>
+            <input
+              class="seek-input"
+              v-model="seekText"
+              inputmode="decimal"
+              spellcheck="false"
+              placeholder="mm:ss"
+              title="输入 mm:ss（如 00:30）或纯秒数（如 30），回车跳转；范围 0:00 ~ 1:00"
+              @input="seekLive"
+              @keydown.enter.prevent="applySeekInput"
+              @keydown.esc="seekText = fmtMMSS(Math.round(virtElapsed))"
+            />
+            <button class="seek-btn" title="后退 10 秒" @click="nudgeSeek(-10)">−10s</button>
+            <button class="seek-btn" title="前进 10 秒" @click="nudgeSeek(10)">+10s</button>
+            <button class="seek-btn go" title="跳转到输入的时间点" @click="applySeekInput">跳转</button>
+          </span>
+          <span class="audio-state" :class="audioChipCls" :title="audioChipTitle">
+            <i></i>{{ audioChipText }}
+          </span>
+          <button class="btn ghost sound" :class="{ muted }" @click="toggleMute" :title="muted ? '开启撞线音效' : '关闭撞线音效'">
+            <svg v-if="muted" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M11 5 6 9H2v6h4l5 4V5z" />
+              <line x1="23" y1="9" x2="17" y2="15" />
+              <line x1="17" y1="9" x2="23" y2="15" />
+            </svg>
+            <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M11 5 6 9H2v6h4l5 4V5z" />
+              <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+              <path d="M18.5 5.5a9 9 0 0 1 0 13" />
+            </svg>
+            {{ muted ? '已静音' : '音效开' }}
+          </button>
+          <button class="btn ghost" @click="testSound" title="立即播放一个 do，用于验证声音并解锁浏览器限制">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M9 18V5l12-2v13" />
+              <circle cx="6" cy="18" r="3" />
+              <circle cx="18" cy="16" r="3" />
+            </svg>
+            试听
+          </button>
+          <button class="btn ghost" @click="reset" title="重置到左侧线段 (R)">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 12a9 9 0 1 0 3-6.7" />
+              <path d="M3 4v5h5" />
+            </svg>
+            重置
+          </button>
+          <button class="btn play" :class="{ paused: !playing }" @click="togglePlay" title="播放/暂停 (空格)">
+            <svg v-if="playing" viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+              <rect x="6" y="5" width="4" height="14" rx="1" />
+              <rect x="14" y="5" width="4" height="14" rx="1" />
+            </svg>
+            <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+              <path d="M8 5.5v13a1 1 0 0 0 1.5.9l11-6.5a1 1 0 0 0 0-1.8l-11-6.5A1 1 0 0 0 8 5.5Z" />
+            </svg>
+            {{ playing ? '暂停' : '播放' }}
+          </button>
+          <button class="icon-btn collapse" title="收起顶部信息栏" @click="headerOpen = false">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6" /></svg>
+          </button>
+        </div>
+      </header>
+
+        <!-- 第一行收起后的极简状态条 -->
+        <div v-else class="dock-head mini-top">
+        <button class="icon-btn" title="展开顶部信息栏" @click="headerOpen = true">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
         </button>
-        <button class="btn ghost" @click="testSound" title="立即播放一个 do，用于验证声音并解锁浏览器限制">
-          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M9 18V5l12-2v13" />
-            <circle cx="6" cy="18" r="3" />
-            <circle cx="18" cy="16" r="3" />
-          </svg>
-          试听
-        </button>
-        <button class="btn ghost" @click="reset" title="重置到左侧线段 (R)">
-          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M3 12a9 9 0 1 0 3-6.7" />
-            <path d="M3 4v5h5" />
-          </svg>
+        <span class="mini-state" :class="{ running: playing }"><i></i>{{ playing ? '运行中' : '已暂停' }}</span>
+        <span class="mini-clock"><b>运行</b>{{ timeReal }}</span>
+        <span class="mini-clock"><b>等效</b>{{ timeVirt }} / 1:00</span>
+        <span class="mini-clock" title="第 n 点（内→外）：60s 内往返 {{ effCount - 1 }}~1 次不等">V 夹角 {{ wedgeDeg }}° · {{ effCount }} 点</span>
+        <button class="btn ghost mini-reset" @click="reset" title="重置 (R)">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7" /><path d="M3 4v5h5" /></svg>
           重置
         </button>
-        <button class="btn play" :class="{ paused: !playing }" @click="togglePlay" title="播放/暂停 (空格)">
-          <svg v-if="playing" viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
-            <rect x="6" y="5" width="4" height="14" rx="1" />
-            <rect x="14" y="5" width="4" height="14" rx="1" />
+        <button class="mini-play" :class="{ paused: !playing }" @click="togglePlay" title="播放/暂停 (空格)">
+          <svg v-if="playing" viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
+            <rect x="6" y="5" width="4" height="14" rx="1" /><rect x="14" y="5" width="4" height="14" rx="1" />
           </svg>
-          <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+          <svg v-else viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
             <path d="M8 5.5v13a1 1 0 0 0 1.5.9l11-6.5a1 1 0 0 0 0-1.8l-11-6.5A1 1 0 0 0 8 5.5Z" />
           </svg>
           {{ playing ? '暂停' : '播放' }}
         </button>
-        <button class="icon-btn collapse" title="收起顶部信息栏" @click="headerOpen = false">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6" /></svg>
-        </button>
       </div>
-    </header>
 
-    <!-- 顶部收起后的极简状态条 -->
-    <div v-else ref="miniEl" class="mini-top">
-      <button class="icon-btn" title="展开顶部信息栏" @click="headerOpen = true">
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
-      </button>
-      <span class="mini-state" :class="{ running: playing }"><i></i>{{ playing ? '运行中' : '已暂停' }}</span>
-      <span class="mini-clock"><b>运行</b>{{ timeReal }}</span>
-      <span class="mini-clock"><b>等效</b>{{ timeVirt }} / 1:00</span>
-      <span class="mini-clock" title="第 n 点（内→外）：60s 内往返 {{ effCount - 1 }}~1 次不等">V 夹角 {{ wedgeDeg }}° · {{ effCount }} 点</span>
-      <button class="btn ghost mini-reset" @click="reset" title="重置 (R)">
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7" /><path d="M3 4v5h5" /></svg>
-        重置
-      </button>
-      <button class="mini-play" :class="{ paused: !playing }" @click="togglePlay" title="播放/暂停 (空格)">
-        <svg v-if="playing" viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
-          <rect x="6" y="5" width="4" height="14" rx="1" /><rect x="14" y="5" width="4" height="14" rx="1" />
-        </svg>
-        <svg v-else viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
-          <path d="M8 5.5v13a1 1 0 0 0 1.5.9l11-6.5a1 1 0 0 0 0-1.8l-11-6.5A1 1 0 0 0 8 5.5Z" />
-        </svg>
-        {{ playing ? '暂停' : '播放' }}
+        <!-- 第二、三行：原底部控制栏（控制项 + 图例） -->
+        <section v-if="panelOpen" class="dock-body">
+        <div class="panel-row controls-row">
+          <div class="pgroup">
+            <span class="plabel">点的数量</span>
+            <div class="stepper">
+              <button class="step" :disabled="effCount <= MIN_COUNT" @click="stepCount(-1)">−</button>
+              <input
+                class="num"
+                type="number"
+                :min="MIN_COUNT"
+                :max="MAX_COUNT"
+                v-model.number="count"
+                @change="setCount(count)"
+              />
+              <button class="step" :disabled="effCount >= MAX_COUNT" @click="stepCount(1)">+</button>
+            </div>
+            <small>默认 30：第 n 点 60s 内往返 {{ effCount }} 递减至 1 次（内快外慢）</small>
+          </div>
+
+          <div class="pgroup">
+            <span class="plabel">两线夹角</span>
+            <div class="range-row">
+              <input
+                class="range"
+                type="range"
+                :min="WEDGE_MIN"
+                :max="WEDGE_MAX"
+                step="1"
+                v-model.number="wedgeDeg"
+                title="两条线段在原点处形成的夹角；默认 135°（单侧相对竖直倾斜 67.5°）。注：需求中“倾斜 62.5°×2=125°”与“夹角 135°”不一致，故默认以 135° 夹角为准，可在此调节"
+              />
+              <output>{{ wedgeDeg }}°</output>
+            </div>
+            <small>单侧相对竖直 {{ (wedgeDeg / 2).toFixed(1) }}°</small>
+          </div>
+
+          <div class="pgroup grow">
+            <span class="plabel">演示倍速</span>
+            <div class="range-row">
+              <input
+                class="range"
+                type="range"
+                min="0.25"
+                max="10"
+                step="0.25"
+                v-model.number="speedScale"
+                title="等比缩放所有点的摆动速度，不改变“内快外慢”的比例"
+              />
+              <output>×{{ speedScale }}</output>
+            </div>
+            <small>60s 内最内层往返 30 次 → 最外层 1 次（按层递减）</small>
+          </div>
+
+          <div class="pgroup">
+            <span class="plabel">连线显示</span>
+            <label class="tick"><input type="checkbox" v-model="showChord" />各点之间连线</label>
+            <label class="tick"><input type="checkbox" v-model="showSpoke" />各点─原点连线</label>
+            <small>连线均比线段路径更淡</small>
+          </div>
+          <button class="icon-btn collapse" title="收起底部控制栏" @click="panelOpen = false">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
+          </button>
+        </div>
+
+        <div class="panel-row legend-row">
+          <span class="lg-title">点序 → 颜色（彩虹循环）与撞线音高（每 7 点升一调）</span>
+          <span
+            v-for="d in meta"
+            :key="d.num"
+            class="lg-chip"
+            :class="{ on: activeIdx === d.i }"
+            :title="d.title"
+            @mouseenter="activeIdx = d.i"
+            @mouseleave="activeIdx = -1"
+          >
+            <i class="lg-dot" :style="{ background: d.color }"></i>
+            <b>{{ d.num }}</b>
+            <em>{{ d.disp }}</em>
+          </span>
+        </div>
+      </section>
+
+      <button v-else class="panel-fab" title="展开底部控制栏" @click="panelOpen = true">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1Z" /></svg>
+        控制
       </button>
     </div>
-
-    <!-- ================= 底部：控制 + 图例（悬浮可折叠） ================= -->
-    <section v-if="panelOpen" ref="panelEl" class="panel">
-      <div class="panel-row controls-row">
-        <div class="pgroup">
-          <span class="plabel">点的数量</span>
-          <div class="stepper">
-            <button class="step" :disabled="effCount <= MIN_COUNT" @click="stepCount(-1)">−</button>
-            <input
-              class="num"
-              type="number"
-              :min="MIN_COUNT"
-              :max="MAX_COUNT"
-              v-model.number="count"
-              @change="setCount(count)"
-            />
-            <button class="step" :disabled="effCount >= MAX_COUNT" @click="stepCount(1)">+</button>
-          </div>
-          <small>默认 30：第 n 点 60s 内往返 {{ effCount }} 递减至 1 次（内快外慢）</small>
-        </div>
-
-        <div class="pgroup">
-          <span class="plabel">两线夹角</span>
-          <div class="range-row">
-            <input
-              class="range"
-              type="range"
-              :min="WEDGE_MIN"
-              :max="WEDGE_MAX"
-              step="1"
-              v-model.number="wedgeDeg"
-              title="两条线段在原点处形成的夹角；默认 135°（单侧相对竖直倾斜 67.5°）。注：需求中“倾斜 62.5°×2=125°”与“夹角 135°”不一致，故默认以 135° 夹角为准，可在此调节"
-            />
-            <output>{{ wedgeDeg }}°</output>
-          </div>
-          <small>单侧相对竖直 {{ (wedgeDeg / 2).toFixed(1) }}°</small>
-        </div>
-
-        <div class="pgroup grow">
-          <span class="plabel">演示倍速</span>
-          <div class="range-row">
-            <input
-              class="range"
-              type="range"
-              min="0.25"
-              max="10"
-              step="0.25"
-              v-model.number="speedScale"
-              title="等比缩放所有点的摆动速度，不改变“内快外慢”的比例"
-            />
-            <output>×{{ speedScale }}</output>
-          </div>
-          <small>60s 内最内层往返 30 次 → 最外层 1 次（按层递减）</small>
-        </div>
-
-        <div class="pgroup">
-          <span class="plabel">连线显示</span>
-          <label class="tick"><input type="checkbox" v-model="showChord" />各点之间连线</label>
-          <label class="tick"><input type="checkbox" v-model="showSpoke" />各点─原点连线</label>
-          <small>连线均比线段路径更淡</small>
-        </div>
-        <button class="icon-btn collapse" title="收起底部控制栏" @click="panelOpen = false">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
-        </button>
-      </div>
-
-      <div class="panel-row legend-row">
-        <span class="lg-title">点序 → 颜色（彩虹循环）与撞线音高（每 7 点升一调）</span>
-        <span
-          v-for="d in meta"
-          :key="d.num"
-          class="lg-chip"
-          :class="{ on: activeIdx === d.i }"
-          :title="d.title"
-          @mouseenter="activeIdx = d.i"
-          @mouseleave="activeIdx = -1"
-        >
-          <i class="lg-dot" :style="{ background: d.color }"></i>
-          <b>{{ d.num }}</b>
-          <em>{{ d.disp }}</em>
-        </span>
-      </div>
-    </section>
-
-    <button v-else class="panel-fab" title="展开底部控制栏" @click="panelOpen = true">
-      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1Z" /></svg>
-      控制
-    </button>
   </div>
 </template>
 
@@ -1119,24 +1114,34 @@ if (AUDIO_DEBUG) {
   height: 100%;
 }
 
-/* ---------- header（悬浮半透明毛玻璃，不占布局） ---------- */
-.sim-header {
+/* ---------- 顶部总控条：header + panel 合并成一条悬浮玻璃卡片 ---------- */
+.dock {
   position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
+  top: 40px;                     /* 让开顶部居中的页面切换器 */
+  left: clamp(8px, 1.6vw, 20px);
+  right: clamp(8px, 1.6vw, 20px);
   z-index: 6;
+  display: flex;
+  flex-direction: column;
+  padding: 0 clamp(12px, 2vw, 24px);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(8, 13, 26, 0.92), rgba(15, 23, 42, 0.74));
+  backdrop-filter: blur(14px);
+  box-shadow: 0 14px 40px rgba(2, 6, 23, 0.5);
+}
+
+/* 第一行：行内左右分栏 —— 标题在左，状态/操作在右，中间留白 */
+.dock-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 14px;
   flex-wrap: nowrap;
-  padding: 8px clamp(16px, 3vw, 32px);
-  border-bottom: 1px solid var(--border);
-  background: linear-gradient(180deg, rgba(8, 13, 26, 0.85), rgba(15, 23, 42, 0.5) 75%, rgba(15, 23, 42, 0));
-  backdrop-filter: blur(10px);
+  min-height: 44px;
+  padding: 8px 0;
 }
-.sim-header h1 {
+.dock-head h1 {
   font-size: 16px;
   font-weight: 700;
   letter-spacing: 0.3px;
@@ -1350,19 +1355,9 @@ if (AUDIO_DEBUG) {
 
 /* ---------- 顶部收起后的极简状态条 ---------- */
 .mini-top {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  z-index: 6;
-  display: flex;
-  align-items: center;
   gap: 10px;
-  padding: 7px 12px;
+  padding: 7px 0;
   flex-wrap: wrap;
-  background: linear-gradient(180deg, rgba(8, 13, 26, 0.9), rgba(15, 23, 42, 0.6));
-  border-bottom: 1px solid var(--border);
-  backdrop-filter: blur(10px);
 }
 .mini-state {
   display: inline-flex;
@@ -1429,33 +1424,21 @@ if (AUDIO_DEBUG) {
   100% { box-shadow: 0 0 0 0 rgba(74, 222, 128, 0); }
 }
 
-/* ---------- panel（悬浮底部，可折叠） ---------- */
-.panel {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  z-index: 6;
+/* 第二、三行：原底部控制栏内容，与第一行上下堆叠 */
+.dock-body {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 10px clamp(14px, 2.5vw, 28px) 12px;
-  background: linear-gradient(0deg, rgba(8, 13, 26, 0.9), rgba(15, 23, 42, 0.6) 85%, rgba(15, 23, 42, 0));
-  border-top: 1px solid var(--border);
-  backdrop-filter: blur(12px);
+  gap: 6px;
+  padding: 8px 0 10px;
+  border-top: 1px dashed rgba(148, 163, 184, 0.2);
 }
 .panel-row {
   display: flex;
   align-items: flex-end;
   gap: clamp(16px, 3vw, 36px);
   flex-wrap: wrap;
-  padding-right: 34px;
 }
-.panel-row .collapse {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-}
+.panel-row .collapse { margin-left: auto; align-self: flex-start; flex: none; }
 .legend-row {
   align-items: center;
   gap: 6px;
@@ -1467,10 +1450,8 @@ if (AUDIO_DEBUG) {
 }
 .legend-row::-webkit-scrollbar { display: none; }
 .panel-fab {
-  position: absolute;
-  bottom: 14px;
-  right: clamp(14px, 3vw, 30px);
-  z-index: 7;
+  align-self: flex-end;
+  margin: 0 0 9px;
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -1625,21 +1606,26 @@ output {
 .lg-chip.on em { color: #fff; }
 
 @media (max-width: 1520px) {
-  .sim-header .seek-btn { display: none; }
+  .dock-head .seek-btn { display: none; }
 }
 @media (max-width: 1380px) {
-  .sim-header .seek-chip { display: none; }
+  .dock-head .seek-chip { display: none; }
 }
 @media (max-width: 1440px) {
-  .sim-header .note-chip { display: none; }
+  .dock-head .note-chip { display: none; }
 }
 @media (max-width: 1280px) {
-  .sim-header .audio-state { display: none; }
+  .dock-head .audio-state { display: none; }
 }
 @media (max-width: 1180px) {
-  .sim-header .btn.sound { display: none; }
+  .dock-head .btn.sound { display: none; }
 }
 @media (max-width: 1080px) {
-  .sim-header .clock-chip { display: none; }
+  .dock-head .clock-chip { display: none; }
+}
+/* 窄屏：第一行允许换行（标题独占一行），避免与顶部切换器抢空间 */
+@media (max-width: 820px) {
+  .dock-head { flex-wrap: wrap; justify-content: center; }
+  .dock-head h1 { width: 100%; text-align: center; }
 }
 </style>
