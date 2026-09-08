@@ -2,9 +2,10 @@
 import { ref } from 'vue'
 import ArcBounceSim from './components/ArcBounceSim.vue'
 import OrbitHarmonySim from './components/OrbitHarmonySim.vue'
+import FanBounceSim from './components/FanBounceSim.vue'
 
-// 页面切换（两个实验页面互斥渲染）
-const page = ref('orbit')
+// 页面切换（三个实验页面互斥渲染）
+const page = ref('fan')
 </script>
 
 <template>
@@ -12,9 +13,17 @@ const page = ref('orbit')
     <nav class="page-switch">
       <button
         class="ps-btn"
+        :class="{ on: page === 'fan' }"
+        @click="page = 'fan'"
+        title="V 形夹角 135° · 30 层彩虹弧摆 · 撞线奏音阶（新增页）"
+      >
+        <i class="fan"></i>V形扇摆
+      </button>
+      <button
+        class="ps-btn"
         :class="{ on: page === 'orbit' }"
         @click="page = 'orbit'"
-        title="圆形轨道 · 12 个变速点 · 经过原点奏响音阶（新增页）"
+        title="圆形轨道 · 12 个变速点 · 经过原点奏响音阶"
       >
         <i class="orb"></i>圆轨音阶
       </button>
@@ -27,7 +36,8 @@ const page = ref('orbit')
         <i class="arc"></i>半圆弹跳
       </button>
     </nav>
-    <OrbitHarmonySim v-if="page === 'orbit'" />
+    <FanBounceSim v-if="page === 'fan'" />
+    <OrbitHarmonySim v-else-if="page === 'orbit'" />
     <ArcBounceSim v-else />
   </div>
 </template>
@@ -92,6 +102,13 @@ const page = ref('orbit')
 .ps-btn .arc {
   background: linear-gradient(90deg, #38bdf8, #22d3ee);
   border-radius: 50%;
+}
+.ps-btn .fan {
+  background:
+    linear-gradient(135deg, transparent 48%, #e0f2fe 49% 51%, transparent 52%),
+    conic-gradient(from 202.5deg at 50% 78%, #f43f5e 0 28%, #fb923c 28% 44%, #facc15 44% 60%, #4ade80 60% 76%, #22d3ee 76% 92%, #818cf8 92% 100%);
+  border-radius: 2px 2px 50% 50%;
+  transform: rotate(45deg) scaleY(0.9);
 }
 
 @media (max-width: 760px) {
