@@ -3,9 +3,10 @@ import { ref } from 'vue'
 import ArcBounceSim from './components/ArcBounceSim.vue'
 import OrbitHarmonySim from './components/OrbitHarmonySim.vue'
 import FanBounceSim from './components/FanBounceSim.vue'
+import EllipseSwarmSim from './components/EllipseSwarmSim.vue'
 
-// 页面切换（三个实验页面互斥渲染）
-const page = ref('fan')
+// 页面切换（四个实验页面互斥渲染）
+const page = ref('ellipse')
 </script>
 
 <template>
@@ -18,6 +19,14 @@ const page = ref('fan')
         title="V 形夹角 135° · 30 层彩虹弧摆 · 撞线奏音阶（新增页）"
       >
         <i class="fan"></i>V形扇摆
+      </button>
+      <button
+        class="ps-btn"
+        :class="{ on: page === 'ellipse' }"
+        @click="page = 'ellipse'"
+        title="椭圆轨道 · 145 个点分 10 层 · 层层发散撞轨反弹 · 90s 全部回归原点并奏响音阶（新增页）"
+      >
+        <i class="ell"></i>层叠发散
       </button>
       <button
         class="ps-btn"
@@ -36,7 +45,8 @@ const page = ref('fan')
         <i class="arc"></i>半圆弹跳
       </button>
     </nav>
-    <FanBounceSim v-if="page === 'fan'" />
+    <EllipseSwarmSim v-if="page === 'ellipse'" />
+    <FanBounceSim v-else-if="page === 'fan'" />
     <OrbitHarmonySim v-else-if="page === 'orbit'" />
     <ArcBounceSim v-else />
   </div>
@@ -109,6 +119,11 @@ const page = ref('fan')
     conic-gradient(from 202.5deg at 50% 78%, #f43f5e 0 28%, #fb923c 28% 44%, #facc15 44% 60%, #4ade80 60% 76%, #22d3ee 76% 92%, #818cf8 92% 100%);
   border-radius: 2px 2px 50% 50%;
   transform: rotate(45deg) scaleY(0.9);
+}
+.ps-btn .ell {
+  background: conic-gradient(#f43f5e, #fb923c, #facc15, #4ade80, #22d3ee, #818cf8, #e879f9, #f43f5e);
+  border-radius: 50%;
+  transform: scaleY(0.62);
 }
 
 @media (max-width: 760px) {
