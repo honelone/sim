@@ -27,7 +27,7 @@ const CYCLE_SECONDS = 90      // 大周期：0s 出发，90s 全部回归原点
 const MAX_FRAME = 0.05        // 单帧最大 dt
 const RING_ALPHA = 0.5        // 外部椭圆轨道不透明度（最亮）
 const LAYER_RING_ALPHA = 0.2  // 各层当前椭圆（< RING_ALPHA，> 连线）
-const LAYER_CHORD_ALPHA = 0.22   // 同层内相邻点连线（比圆形路径更淡，但清晰可见）
+const LAYER_CHORD_ALPHA = 0.5   // 同层内相邻点连线（比圆形路径更淡，但清晰可见）
 const ORIGIN_R = 7            // 原点半径
 const MIN_NOTE_GAP = 0.11     // 相邻发声最小真实间隔（层回归约 1.6 次/秒）
 const DEFAULT_SPEED = 1       // 默认倍速（下拉选项 1x/2x/5x/10x）
@@ -391,7 +391,7 @@ function drawConnectors(ctx) {
   for (let i = 1; i < TOTAL_POINTS; i++) {
     if (DOTS[i].layer !== DOTS[i - 1].layer) continue   // 仅同层相连；层间与层首尾端点不连
     const h = DOTS[i].h
-    ctx.strokeStyle = hsla(h, 90, 72, LAYER_CHORD_ALPHA)
+    ctx.strokeStyle = hsla(h, 92, 56, LAYER_CHORD_ALPHA)
     ctx.beginPath()
     ctx.moveTo(pos[(i - 1) * 2], pos[(i - 1) * 2 + 1])
     ctx.lineTo(pos[i * 2], pos[i * 2 + 1])
