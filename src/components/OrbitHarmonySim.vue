@@ -1,93 +1,107 @@
 <script setup>
-import { onMounted, onBeforeUnmount, ref, computed } from 'vue'
+import { onMounted, onBeforeUnmount, ref, watch, computed } from 'vue'
 import SimDock from './SimDock.vue'
 
 /* =========================================================
- * 需求映射：
- *  1. 全部运动点沿同一椭圆轨道运动（点尺寸略大，居中）
- *  2. 自然大调 7 个音高（do re mi fa sol la si）各分配一个运动点 → 共 7 个
- *  3. 每个点的运动周期 = 该音音符时值 × 整体缩放；相邻音依次放慢，
- *     形成“由快到慢”的优美视觉节奏；整体缩放可调（倍速）
- *  4. 和弦连线：7 个点的实时位置两两连线，构成随时间呼吸的星形多边形
- *  5. 连线状态可切换：显示 / 隐藏（默认显示）
- *  6. 每个运动点用音高对应颜色（彩虹七色），轨道用较淡同色
- *  7. 顶部/底部信息展示与既有实验页保持同一视觉语言
+ * 圆轨十二音：页面正中绘制圆形轨道，最顶部为固定原点；
+ * 各运动点从原点出发沿圆轨运行，每跑完一圈（回到原点）即奏响对应音。
+ * 速度：第 n 点每 60s 运行 n 圈（点序即“第几圈/60s”）。
+ * 点数可由顶部总控条调整（与其它实验页一致的步进器）。
+ * 头部与半圆弹跳页一致（SimDock）；方向/连线显示控制已取消
+ * （连线常显、方向固定逆时针，无切换 UI）。
  * ========================================================= */
 
 /* ---------- 常量 ---------- */
-const NOTE_NAMES = ['do', 're', 'mi', 'fa', 'sol', 'la', 'si']
-const NOTE_FREQS = [261.63, 293.66, 329.63, 349.23, 392.0, 440.0, 493.88]
-const BEAT = 0.6                  // 基础音符时值（秒），整体缩放基准
-const MIN_FRAME = 0.05            // 单帧最大 dt
-const DEFAULT_SPEED = 1           // 默认倍速（下拉选项 1x/2x/5x/10x）
-const RING_BASE_ALPHA = 0.75      // 轨道基础不透明度（最亮）
-const CHORD_ALPHA = 0.32          // 连线不透明度
-const ORBIT_CX_RATIO = 0.5
-const ORBIT_CY_RATIO = 0.56
+const LAP_SECONDS = 60         // 定义周期：第 n 点每 60s 运行 n 圈
+const MAX_FRAME = 0.05         // 单帧最大 dt（防后台切回跳变）
+const RING_ALPHA = 0.5         // 圆形轨道不透明度
+const SPOKE_ALPHA = 0.16       // 点-原点连线不透明度（< RING_ALPHA）
+const CHORD_ALPHA = 0.1        // 点间连线不透明度（< RING_ALPHA）
+const ORIGIN_R = 7             // 原点半径
+const DIR = 1                  // 方向：1=逆时针（默认，固定，无切换 UI）
+const MIN_POINTS = 1           // 点数下限
+const MAX_POINTS = 24          // 点数上限（足够展示十二音、不至于过密）
 const AUDIO_DEBUG = true
 
-// 彩虹七色（红橙黄绿蓝靛紫），与音阶一一对应
-const RAINBOW_HUES = [0, 30, 55, 130, 205, 240, 285]
+// 音阶：do re mi fa sol la si（自然大调 C4~B4）
+const NOTE_FREQS = [261.63, 293.66, 329.63, 349.23, 392.0, 440.0, 493.88]
+const NOTE_NAMES = ['do', 're', 'mi', 'fa', 'sol', 'la', 'si']
+
 function hsl(h, s, l) { return `hsl(${h}, ${s}%, ${l}%)` }
 function hsla(h, s, l, a) { return `hsla(${h}, ${s}%, ${l}%, ${a})` }
 
-// 7 个音的运动周期：do 最快，依次放慢（倍数随音序号递增）
-const POINTS = NOTE_NAMES.map((name, i) => {
-  const h = RAINBOW_HUES[i]
-  return {
-    i,
-    name,
-    freq: NOTE_FREQS[i],
-    h,
-    color: hsl(h, 92, 62),
-    light: hsl(h, 96, 82),
-    dark: hsl(h, 88, 44),
-    period: BEAT * (1 + i * 0.55),  // 相邻音依次放慢，形成由快到慢的节奏
-  }
-})
-const N = POINTS.length
+// 每个点预生成颜色 + 音符信息（点序号与音符/颜色一一对应）
+// 颜色按数量在色环上均分；音高按 do re mi… 循环、超 7 个升八度
+function makeDots(n) {
+  return Array.from({ length: n }, (_, i) => {
+    const h = Math.round(i * (360 / n)) % 360
+    const semi = i % 7
+    const oct = Math.floor(i / 7)
+    return {
+      i, num: i + 1, h,
+      color: hsl(h, 92, 62),
+      light: hsl(h, 96, 82),
+      dark: hsl(h, 88, 44),
+      freq: NOTE_FREQS[semi] * Math.pow(2, oct),
+      name: oct > 0 ? `${NOTE_NAMES[semi]}′` : NOTE_NAMES[semi],
+      title: oct > 0 ? `${NOTE_NAMES[semi]}（升八度）` : NOTE_NAMES[semi],
+    }
+  })
+}
+const DOTS = computed(() => makeDots(countInput.value))
 
-/* ---------- 交互状态 ---------- */
-const speedScale = ref(DEFAULT_SPEED)
+/* ---------- 交互状态（响应式） ---------- */
+const countInput = ref(12)         // 运动点数量（默认 12，可手动调整）
+const speedScale = ref(1)          // 演示倍速（等比压缩周期，不影响 n:1 圈速比）
 const playing = ref(false)
 const muted = ref(false)
-const showChord = ref(true)
-const direction = ref(1)           // 1 顺时针 / -1 逆时针
-const lastNote = ref(null)         // 最近一次发声的音符（名称+颜色）
-const activeIdx = ref(-1)         // 当前高亮发声的点（图例联动）
+const activeIdx = ref(-1)          // 当前高亮（刚经过原点）的点索引
 
 const canvasRef = ref(null)
 const stageRef = ref(null)
-const dockRef = ref(null)   // 顶部总控条（SimDock 组件根，供 layout 测量遮挡高度）
+const dockRef = ref(null)           // 顶部总控条（SimDock 组件根，供 layout 测量遮挡高度）
+
+/* ---------- 点的数量控制（与其它页面一致） ---------- */
+function setCount(value) {
+  countInput.value = Math.min(Math.max(Math.round(Number(value) || 1), MIN_POINTS), MAX_POINTS)
+}
+function stepCount(delta) {
+  setCount((Number(countInput.value) || 1) + delta)
+}
+
+/* ---------- 音频运行时（非响应式） ---------- */
+let audioCtx = null            // AudioContext
+let masterGain = null          // 主音量节点
+let resumePromise = null
+let audioRetryTimer = 0
+let highlightTimer = 0
+let lastResumeProbe = 0
+let pendingNotes = []          // ctx 未就绪时排队待补发的音符
+const audioStats = { builds: 0, unlockCalls: 0, noteAttempts: 0, notesScheduled: 0, notesFlushed: 0, passes: 0 }
 
 /* ---------- 运行时非响应式数据 ---------- */
 const sim = {
   w: 0, h: 0, dpr: 1,
-  cx: 0, cy: 0, R: 0,           // 椭圆基准：以圆近似，再按宽高比例拉伸
-  rx: 0, ry: 0, dotR: 7,
-  ripples: [],
-  pos: new Float64Array(N * 2),  // 每个点的实时坐标
+  cx: 0, cy: 0, R: 0,
+  pts: [],       // 运动点：{ i, num, f }，f∈[0,1) 圈内相位（0=原点）；数量随 countInput 变化
+  ripples: [],   // 经过原点时的冲击波纹
 }
-const orbit = Array.from({ length: N }, () => ({ phase: 0, angle: 0 }))
 
-let rafId = 0
-let lastTs = 0
-let resizeObserver = null
-let realElapsed = 0
-let virtElapsed = 0
+// 数量变化时同步运动点数组：尽量保留已有相位，新增点从原点出发
+function syncPoints() {
+  const n = countInput.value
+  const old = sim.pts
+  sim.pts = Array.from({ length: n }, (_, i) => {
+    const prev = old[i]
+    return { i, num: i + 1, f: prev ? prev.f : 0 }
+  })
+}
 
-/* ---------- 音频 runtime ---------- */
-let audioCtx = null
-let masterGain = null
-let resumePromise = null
-let audioRetryTimer = 0
-let noticeTimer = 0
-let highlightTimer = 0
-let lastResumeProbe = 0
-let pendingSeq = []
-const audioStats = { builds: 0, unlockCalls: 0, noteAttempts: 0, notesScheduled: 0, passes: 0 }
+let rafId = 0                  // requestAnimationFrame id
+let lastTs = 0                 // 上一帧时间戳
+let resizeObserver = null      // 画布尺寸自适应
 
-/* ---------- 布局 ---------- */
+/* ---------- 几何布局：圆居中，原点位于轨道最顶部 ---------- */
 function layout() {
   const canvas = canvasRef.value
   const stage = stageRef.value
@@ -103,32 +117,28 @@ function layout() {
   canvas.width = Math.round(w * dpr)
   canvas.height = Math.round(h * dpr)
 
-  // 顶部总控条已合并为一条：直接测量它实际遮挡的顶部高度（含与顶部的间距）
-  const padT = (dockRef.value && dockRef.value.root ? dockRef.value.root.getBoundingClientRect().bottom - rect.top : 200) + 30
-  const padB = 26
+  // 顶部总控条：直接测量 SimDock 实际遮挡的顶部高度（含与顶部的间距）
+  const simRoot = stageRef.value.closest('.sim-root') || stageRef.value.parentElement
+  const dockEl = simRoot && simRoot.querySelector('.dock')
+  const padT = (dockEl ? dockEl.getBoundingClientRect().bottom - rect.top : 96) + 16
+  const padB = 22
   const regionTop = padT
-  const regionBottom = Math.max(padT + 120, h - padB)
+  const regionBottom = Math.max(padT + 80, h - padB)
   const regionH = regionBottom - regionTop
 
-  sim.cx = w * ORBIT_CX_RATIO
+  // 圆居中于可用区域；半径取可用宽高的最小值
+  sim.cx = w / 2
   sim.cy = regionTop + regionH / 2
-  const availH = regionH
-  const availW = w * 0.84
-  sim.rx = Math.max(60, Math.min(availW / 2 - 24, availH * 1.35))
-  sim.ry = Math.max(48, Math.min(availH / 2 - 14, sim.rx * 0.66))
-  sim.dotR = Math.max(5, Math.min(9, sim.rx * 0.02))
+  sim.R = Math.max(40, Math.min(w / 2 - 56, regionH / 2 - 8))
 }
 
-/* ---------- 控制 ---------- */
+/* ---------- 重置 / 播放 / 静音 ---------- */
 function reset() {
   playing.value = false
-  unlockAudio()
+  unlockAudio() // 重置按钮在用户手势内，顺带解锁音频
   sim.ripples.length = 0
-  realElapsed = 0
-  virtElapsed = 0
-  lastNote.value = null
+  for (const p of sim.pts) p.f = 0
   activeIdx.value = -1
-  for (const o of orbit) { o.phase = 0; o.angle = 0 }
 }
 
 function togglePlay() {
@@ -139,18 +149,10 @@ function togglePlay() {
 function toggleMute() {
   muted.value = !muted.value
   unlockAudio()
-  flashNotice(muted.value ? '声音已关闭（静音）' : '声音已开启', 1400)
-}
-
-function setDirection(dir) {
-  direction.value = dir
-  flashNotice(dir > 0 ? '顺时针' : '逆时针', 1200)
 }
 
 /* =========================================================
  * 音频：Web Audio 实时合成（无外部文件）
- * 每个运动点经过椭圆最右侧（即“12 点钟”最高点）时奏响其对应音，
- * 音高 = do re mi fa sol la si（按点序），并做最小间隔节流。
  * ========================================================= */
 function buildAudioGraph() {
   if (audioCtx && audioCtx.state !== 'closed') return true
@@ -161,11 +163,11 @@ function buildAudioGraph() {
     audioCtx = new AC()
     audioCtx.addEventListener('statechange', onAudioStateChange)
     masterGain = audioCtx.createGain()
-    masterGain.gain.value = 0.34
+    masterGain.gain.value = 0.5
     const comp = audioCtx.createDynamicsCompressor()
     comp.threshold.value = -16
     comp.knee.value = 20
-    comp.ratio.value = 8
+    comp.ratio.value = 6
     comp.attack.value = 0.003
     comp.release.value = 0.25
     masterGain.connect(comp)
@@ -210,21 +212,13 @@ function scheduleRetry() {
   }, 900)
 }
 
-function flashNotice(text, ms = 2600) {
-  if (noticeTimer) clearTimeout(noticeTimer)
-  noticeTimer = setTimeout(() => { noticeTimer = 0 }, ms)
-  void text
-}
-
 function flushPending() {
-  if (!pendingSeq.length || !audioCtx || audioCtx.state !== 'running') return
-  const batch = pendingSeq.splice(0)
-  for (const seq of batch) {
-    try { if (scheduleNoteNow(seq)) audioStats.notesScheduled++ } catch (e) {}
-  }
+  if (!pendingNotes.length || !audioCtx || audioCtx.state !== 'running') return
+  const batch = pendingNotes.splice(0)
+  for (const i of batch) { try { if (scheduleNoteNow(i)) audioStats.notesFlushed++ } catch (e) {} }
 }
 
-// 单音：指数衰减（钟琴质感），附带一个高八度泛音“叮”
+// 弹奏单个正弦音（指数衰减，钟琴质感）
 function strike(freq, t0, type, peak, decay) {
   if (!audioCtx || !masterGain) return
   const osc = audioCtx.createOscillator()
@@ -232,50 +226,36 @@ function strike(freq, t0, type, peak, decay) {
   osc.type = type
   osc.frequency.value = freq
   g.gain.setValueAtTime(0.0001, t0)
-  g.gain.exponentialRampToValueAtTime(peak, t0 + 0.005)
+  g.gain.exponentialRampToValueAtTime(peak, t0 + 0.006)
   g.gain.exponentialRampToValueAtTime(0.0001, t0 + decay)
   osc.connect(g)
   g.connect(masterGain)
   osc.start(t0)
-  osc.stop(t0 + decay + 0.05)
+  osc.stop(t0 + decay + 0.06)
   osc.onended = () => { osc.disconnect(); g.disconnect() }
 }
 
-// 顶点（12 点钟）发声：只有当 ctx 处于 running 且未静音时“真正”发出
-function scheduleNoteNow(seq) {
+// 真正调度音符：仅在 ctx running 且未静音时执行
+function scheduleNoteNow(i) {
   if (muted.value || !audioCtx || !masterGain || audioCtx.state !== 'running') return false
-  const f = POINTS[seq].freq
   const t0 = audioCtx.currentTime
+  const f = DOTS.value[i].freq
   try {
-    strike(f, t0, 'sine', 0.5, 0.85)
-    strike(f * 2.01, t0, 'sine', 0.12, 0.26)
+    strike(f, t0, 'sine', 0.5, 1.0)              // 基音
+    strike(f * 2.01, t0, 'sine', 0.12, 0.3)     // 八度泛音“叮”
+    strike(f * 4.07, t0, 'sine', 0.05, 0.12)    // 高频亮色
+    audioStats.notesScheduled++
     return true
-  } catch (err) {
-    console.warn('音符调度失败', err)
-    return false
-  }
+  } catch (err) { console.warn('音符调度失败', err); return false }
 }
 
-// 点经过椭圆最右端（角度约 -90°，即 12 点钟顶点）时触发
-function onVertex(i) {
-  audioStats.passes++
-  const p = POINTS[i]
-  if (sim.ripples.length < 16) sim.ripples.push({ x: sim.pos[i * 2], y: sim.pos[i * 2 + 1], age: 0, h: p.h })
-  lastNote.value = { name: p.name, color: p.color, title: `${p.name}（${p.freq.toFixed(0)}Hz）` }
-  activeIdx.value = i
-  clearTimeout(highlightTimer)
-  highlightTimer = setTimeout(() => { activeIdx.value = -1 }, 320)
-}
-
-function playNote(seq) {
-  if (muted.value) return
+// 第 i 个点经过原点时发声；ctx 未解锁时入队待补发
+function playPassNote(i) {
   audioStats.noteAttempts++
-  if (audioCtx && audioCtx.state === 'running') {
-    if (scheduleNoteNow(seq)) audioStats.notesScheduled++
-    return
-  }
+  if (muted.value) return
+  if (audioCtx && audioCtx.state === 'running') { scheduleNoteNow(i); return }
   if (buildAudioGraph()) {
-    if (pendingSeq.length < 16) pendingSeq.push(seq)
+    if (pendingNotes.length < 32) pendingNotes.push(i)
     unlockAudio()
   }
 }
@@ -289,167 +269,206 @@ function audioSupervisor() {
   }
 }
 
-/* ---------- 运动 ---------- */
+/* ---------- 运动物理：点速 = 序号 n 圈/60s，圈相位在原点处清零检测 ---------- */
+function triggerPass(i) {
+  audioStats.passes++
+  playPassNote(i)
+  const ox = sim.cx
+  const oy = sim.cy - sim.R
+  sim.ripples.push({ x: ox, y: oy, age: 0, h: DOTS.value[i].h })
+  if (sim.ripples.length > 20) sim.ripples.shift()
+  activeIdx.value = DOTS.value[i].i
+  clearTimeout(highlightTimer)
+  highlightTimer = setTimeout(() => { activeIdx.value = -1 }, 420)
+}
+
 function updateSim(dt) {
   const scale = Number(speedScale.value) || 1
-  realElapsed += dt
-  virtElapsed += dt * scale
-  for (let i = 0; i < N; i++) {
-    const o = orbit[i]
-    // 角速度 = 2π / 周期
-    const w = (2 * Math.PI) / POINTS[i].period
-    const prevAngle = o.angle
-    o.angle += direction.value * w * dt * scale
-    o.phase += direction.value * w * dt * scale
-    // 经过椭圆最右端（角度约 -90°，即 12 点钟顶点）时触发发声与波纹
-    let a = o.angle - prevAngle
-    // 归一化到 [-π, π]，判断是否跨过 -π/2（顶部）
-    let crossed = false
-    let t = Math.atan2(Math.sin(prevAngle + Math.PI / 2), Math.cos(prevAngle + Math.PI / 2))
-    let t2 = Math.atan2(Math.sin(o.angle + Math.PI / 2), Math.cos(o.angle + Math.PI / 2))
-    // 跨过 π→-π 边界处理
-    if (t2 - t > Math.PI) t2 -= 2 * Math.PI
-    if (t - t2 > Math.PI) t2 += 2 * Math.PI
-    crossed = (t <= 0 && t2 >= 0) || (t >= 0 && t2 <= 0)
-    void a
-    if (crossed) onVertex(i), playNote(i)
+  for (const p of sim.pts) {
+    const step = (DIR * p.num * scale * dt) / LAP_SECONDS // 本帧移动量（圈）
+    const raw = p.f + step
+    const crossed = Math.floor(raw)                     // f∈[0,1)：floor 即跨过原点的整圈数
+    if (crossed !== 0) {
+      const c = Math.abs(crossed)
+      for (let k = 0; k < c; k++) triggerPass(p.i)
+    }
+    p.f = raw - Math.floor(raw)
   }
   for (let i = sim.ripples.length - 1; i >= 0; i--) {
     sim.ripples[i].age += dt
-    if (sim.ripples[i].age > 0.7) sim.ripples.splice(i, 1)
+    if (sim.ripples[i].age > 0.8) sim.ripples.splice(i, 1)
   }
 }
 
 /* ---------- 渲染 ---------- */
+function posOf(f, R) {
+  const rr = R === undefined ? sim.R : R
+  const th = Math.PI * 2 * f
+  // DIR=1：相位增大 → 顶部→左→下→右（视觉逆时针），f=0 即原点（轨道最顶端）
+  return {
+    x: sim.cx - DIR * rr * Math.sin(th),
+    y: sim.cy - rr * Math.cos(th),
+  }
+}
+
 function render() {
   const canvas = canvasRef.value
   if (!canvas || !sim.w) return
-  updatePositions()
   const ctx = canvas.getContext('2d')
   ctx.setTransform(sim.dpr, 0, 0, sim.dpr, 0, 0)
   ctx.clearRect(0, 0, sim.w, sim.h)
   drawRing(ctx)
-  drawChords(ctx)
+  drawConnectors(ctx)
   drawRipples(ctx)
   drawOrigin(ctx)
   drawDots(ctx)
 }
 
-function updatePositions() {
-  for (let i = 0; i < N; i++) {
-    const o = orbit[i]
-    // 椭圆参数：以最右端为起点（角度 -90° 即 12 点钟），顺时针运动
-    const ang = o.angle
-    sim.pos[i * 2] = sim.cx + sim.rx * Math.cos(ang)
-    sim.pos[i * 2 + 1] = sim.cy + sim.ry * Math.sin(ang)
-  }
-}
-
-// 轨道（较淡的彩虹七色描边）
+// 圆形轨道（页面正中）
 function drawRing(ctx) {
-  ctx.save()
-  ctx.lineWidth = 1.6
-  for (let i = 0; i < N; i++) {
-    const p = POINTS[i]
-    ctx.strokeStyle = hsla(p.h, 90, 65, RING_BASE_ALPHA * 0.6)
-    ctx.beginPath()
-    ctx.ellipse(sim.cx, sim.cy, sim.rx, sim.ry, 0, 0, Math.PI * 2)
-    ctx.stroke()
-  }
-  ctx.restore()
-}
-
-// 和弦连线：7 个点两两相连，构成随时间呼吸的星形多边形
-function drawChords(ctx) {
-  if (!showChord.value) return
-  const pos = sim.pos
+  const { cx, cy, R } = sim
   ctx.save()
   ctx.lineCap = 'round'
-  ctx.lineJoin = 'round'
-  ctx.lineWidth = 1.4
-  ctx.strokeStyle = `rgba(186,230,253,${CHORD_ALPHA})`
+  // 外层柔光
   ctx.beginPath()
-  for (let i = 0; i < N; i++) {
-    for (let j = i + 1; j < N; j++) {
-      ctx.moveTo(pos[i * 2], pos[i * 2 + 1])
-      ctx.lineTo(pos[j * 2], pos[j * 2 + 1])
-    }
-  }
+  ctx.arc(cx, cy, R, 0, Math.PI * 2)
+  ctx.strokeStyle = 'rgba(56,189,248,0.10)'
+  ctx.lineWidth = 12
+  ctx.stroke()
+  // 主轨道
+  const grad = ctx.createRadialGradient(cx, cy, R - 8, cx, cy, R + 8)
+  grad.addColorStop(0, 'rgba(125,211,252,0.1)')
+  grad.addColorStop(0.5, `rgba(148,210,253,${RING_ALPHA})`)
+  grad.addColorStop(1, 'rgba(125,211,252,0.1)')
+  ctx.beginPath()
+  ctx.arc(cx, cy, R, 0, Math.PI * 2)
+  ctx.strokeStyle = grad
+  ctx.lineWidth = 1.6
   ctx.stroke()
   ctx.restore()
 }
 
+// 各点与原点连线 + 各运动点两两连线（都比轨道淡，常显）
+function drawConnectors(ctx) {
+  ctx.save()
+  ctx.lineCap = 'round'
+  const ox = sim.cx
+  const oy = sim.cy - sim.R // 原点=轨道最顶部
+  const n = sim.pts.length
+
+  // 每个运动点 → 原点
+  ctx.lineWidth = 1
+  for (const p of sim.pts) {
+    const pt = posOf(p.f)
+    ctx.strokeStyle = hsla(DOTS.value[p.i].h, 92, 66, SPOKE_ALPHA)
+    ctx.beginPath()
+    ctx.moveTo(ox, oy)
+    ctx.lineTo(pt.x, pt.y)
+    ctx.stroke()
+  }
+
+  // 各运动点两两之间
+  ctx.lineWidth = 0.8
+  ctx.strokeStyle = `rgba(190,214,255,${CHORD_ALPHA})`
+  for (let i = 0; i < n; i++) {
+    const a = posOf(sim.pts[i].f)
+    for (let j = i + 1; j < n; j++) {
+      const b = posOf(sim.pts[j].f)
+      ctx.beginPath()
+      ctx.moveTo(a.x, a.y)
+      ctx.lineTo(b.x, b.y)
+      ctx.stroke()
+    }
+  }
+  ctx.restore()
+}
+
 function drawRipples(ctx) {
-  if (!sim.ripples.length) return
   ctx.save()
   for (const r of sim.ripples) {
-    const t = Math.min(r.age / 0.7, 1)
+    const t = Math.min(r.age / 0.8, 1)
+    const rad = 8 + t * (sim.R * 0.16)
     ctx.beginPath()
-    ctx.arc(r.x, r.y, 8 + t * 30, 0, Math.PI * 2)
-    ctx.strokeStyle = hsla(r.h ?? 0, 92, 70, (1 - t) * 0.6)
-    ctx.lineWidth = 1.8
+    ctx.arc(r.x, r.y, rad, 0, Math.PI * 2)
+    ctx.strokeStyle = hsla(r.h ?? DOTS.value[0].h, 92, 68, (1 - t) * 0.7)
+    ctx.lineWidth = 2
     ctx.stroke()
   }
   ctx.restore()
 }
 
-// 中心原点（七色光晕，寓意和弦中心）
+// 固定原点（轨道最顶部）
 function drawOrigin(ctx) {
-  const { cx, cy } = sim
+  const { cx } = sim
+  const oy = sim.cy - sim.R
   ctx.save()
-  let glow = ctx.createRadialGradient(cx, cy, 2, cx, cy, 30)
-  const stops = POINTS.map((p, k) => [k / (N - 1), p.color])
-  glow.addColorStop(0, 'rgba(255,255,255,0.9)')
-  for (const [pos, color] of stops) glow.addColorStop(pos, hsla(POINTS[Math.round(pos * (N - 1))].h, 92, 65, 0.25))
-  glow.addColorStop(1, 'rgba(255,255,255,0)')
+  // 外发光
+  const glow = ctx.createRadialGradient(cx, oy, 2, cx, oy, ORIGIN_R * 3.4)
+  glow.addColorStop(0, 'rgba(253,224,71,0.4)')
+  glow.addColorStop(1, 'rgba(253,224,71,0)')
   ctx.fillStyle = glow
   ctx.beginPath()
-  ctx.arc(cx, cy, 30, 0, Math.PI * 2)
+  ctx.arc(cx, oy, ORIGIN_R * 3.4, 0, Math.PI * 2)
   ctx.fill()
-  ctx.fillStyle = 'rgba(226,232,240,0.9)'
+  // 主体
+  const body = ctx.createRadialGradient(cx - 2, oy - 3, 1, cx, oy, ORIGIN_R + 2)
+  body.addColorStop(0, '#fff7ed')
+  body.addColorStop(0.55, '#fcd34d')
+  body.addColorStop(1, '#f59e0b')
+  ctx.fillStyle = body
   ctx.beginPath()
-  ctx.arc(cx, cy, 4, 0, Math.PI * 2)
+  ctx.arc(cx, oy, ORIGIN_R, 0, Math.PI * 2)
   ctx.fill()
+  ctx.strokeStyle = 'rgba(255,255,255,0.92)'
+  ctx.lineWidth = 1.4
+  ctx.stroke()
+  ctx.fillStyle = '#ffffff'
+  ctx.beginPath()
+  ctx.arc(cx, oy, 1.8, 0, Math.PI * 2)
+  ctx.fill()
+  // 文字标签
+  ctx.font = '11px system-ui, "Microsoft YaHei", sans-serif'
+  ctx.textAlign = 'center'
+  ctx.fillStyle = 'rgba(252,211,77,0.85)'
+  ctx.fillText('原点', cx, oy - ORIGIN_R - 8)
   ctx.restore()
 }
 
+// 运动点（彩虹着色球体）
 function drawDots(ctx) {
-  const pos = sim.pos
-  const dotR = sim.dotR
+  const dotR = Math.max(4, Math.min(7.5, sim.R * 0.024))
   const active = activeIdx.value
-  for (let i = 0; i < N; i++) {
-    const p = POINTS[i]
-    const x = pos[i * 2]
-    const y = pos[i * 2 + 1]
-    const glow = ctx.createRadialGradient(x, y, 1, x, y, dotR * 3)
-    glow.addColorStop(0, hsla(p.h, 92, 66, 0.45))
-    glow.addColorStop(1, hsla(p.h, 92, 66, 0))
-    ctx.fillStyle = glow
-    ctx.beginPath()
-    ctx.arc(x, y, dotR * 3, 0, Math.PI * 2)
-    ctx.fill()
-
-    const g = ctx.createRadialGradient(x - dotR * 0.35, y - dotR * 0.42, dotR * 0.15, x, y, dotR * 1.3)
+  for (const p of sim.pts) {
+    const pt = posOf(p.f)
+    const c = DOTS.value[p.i]
+    ctx.save()
+    // 色晕
+    ctx.shadowColor = c.color
+    ctx.shadowBlur = 12
+    const g = ctx.createRadialGradient(
+      pt.x - dotR * 0.35, pt.y - dotR * 0.42, dotR * 0.12,
+      pt.x, pt.y, dotR * 1.25
+    )
     g.addColorStop(0, '#ffffff')
-    g.addColorStop(0.4, p.light)
-    g.addColorStop(0.8, p.color)
-    g.addColorStop(1, p.dark)
+    g.addColorStop(0.35, c.light)
+    g.addColorStop(0.75, c.color)
+    g.addColorStop(1, c.dark)
     ctx.fillStyle = g
     ctx.beginPath()
-    ctx.arc(x, y, dotR, 0, Math.PI * 2)
+    ctx.arc(pt.x, pt.y, dotR, 0, Math.PI * 2)
     ctx.fill()
-    if (i === active) {
-      ctx.strokeStyle = 'rgba(255,255,255,0.95)'
-      ctx.lineWidth = 2
-      ctx.stroke()
-    }
+    ctx.shadowBlur = 0
+    ctx.strokeStyle = p.i === active ? 'rgba(255,255,255,0.95)' : 'rgba(255,255,255,0.75)'
+    ctx.lineWidth = p.i === active ? 2 : 1
+    ctx.stroke()
+    ctx.restore()
   }
 }
 
 /* ---------- 主循环 ---------- */
 function tick(ts) {
   rafId = requestAnimationFrame(tick)
-  const dt = lastTs ? Math.min(Math.max((ts - lastTs) / 1000, 0), MIN_FRAME) : 0
+  const dt = lastTs ? Math.min(Math.max((ts - lastTs) / 1000, 0), MAX_FRAME) : 0
   lastTs = ts
   if (playing.value) {
     updateSim(dt)
@@ -459,6 +478,7 @@ function tick(ts) {
 }
 
 function onUserGesture() { unlockAudio() }
+
 function onKeydown(e) {
   if (e.code === 'Space' && e.target.tagName !== 'INPUT' && e.target.tagName !== 'BUTTON') {
     e.preventDefault()
@@ -468,9 +488,11 @@ function onKeydown(e) {
   }
 }
 
+watch(countInput, () => { syncPoints(); layout() })
+
 onMounted(() => {
+  syncPoints()
   layout()
-  render()
   rafId = requestAnimationFrame(tick)
   resizeObserver = new ResizeObserver(() => layout())
   resizeObserver.observe(stageRef.value)
@@ -486,7 +508,6 @@ onBeforeUnmount(() => {
   window.removeEventListener('pointerdown', onUserGesture)
   window.removeEventListener('keydown', onUserGesture)
   clearTimeout(audioRetryTimer)
-  clearTimeout(noticeTimer)
   clearTimeout(highlightTimer)
   if (audioCtx && audioCtx.state !== 'closed') {
     audioCtx.close().catch(() => {})
@@ -500,8 +521,7 @@ if (AUDIO_DEBUG) {
     get ctxState() { return audioCtx ? audioCtx.state : 'none' },
     get playing() { return playing.value },
     get speed() { return speedScale.value },
-    get chord() { return showChord.value },
-    get dir() { return direction.value },
+    get count() { return countInput.value },
     stats: audioStats,
     unlock: () => unlockAudio(),
   }
@@ -510,19 +530,26 @@ if (AUDIO_DEBUG) {
 
 <template>
   <div class="sim-root">
+    <!-- 主运行区：画布占满视口，控制条悬浮其上 -->
     <div class="stage" ref="stageRef">
       <canvas ref="canvasRef" class="sim-canvas"></canvas>
     </div>
 
+    <!-- 顶部总控条：与其它实验页一致（点的数量 / 倍速 / 重置 / 音效 / 播放） -->
     <SimDock
       ref="dockRef"
       :playing="playing"
       :muted="muted"
-      :show-count="false"
+      :show-count="true"
+      :count="countInput"
+      :count-min="MIN_POINTS"
+      :count-max="MAX_POINTS"
       :speed="speedScale"
       @toggle-play="togglePlay"
       @toggle-mute="toggleMute"
       @reset="reset"
+      @update:count="setCount"
+      @step-count="stepCount"
       @update:speed="(v) => (speedScale = v)"
     />
   </div>
@@ -546,149 +573,4 @@ if (AUDIO_DEBUG) {
   width: 100%;
   height: 100%;
 }
-
-/* ---------- 顶部总控条：合并后的整体悬浮玻璃卡片 ---------- */
-.dock {
-  position: absolute;
-  top: 40px;                     /* 让开顶部居中的页面切换器 */
-  left: clamp(8px, 1.6vw, 20px);
-  right: clamp(8px, 1.6vw, 20px);
-  z-index: 6;
-  border: 1px solid var(--border);
-  border-radius: 16px;
-  background: linear-gradient(180deg, rgba(8, 13, 26, 0.92), rgba(15, 23, 42, 0.74));
-  backdrop-filter: blur(14px);
-  box-shadow: 0 14px 40px rgba(2, 6, 23, 0.5);
-}
-
-/* 合并后的整体控制条：操作按钮 + 参数控件 一行流式排列 */
-.dock-inner {
-  display: flex;
-  flex-wrap: wrap;
-  flex-direction: row-reverse;
-  align-items: center;
-  gap: clamp(10px, 2vw, 22px);
-  padding: 10px clamp(12px, 2vw, 20px);
-}
-.actions {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  flex: none;
-}
-.controls {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: clamp(14px, 2.4vw, 36px);
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-
-
-.btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  border: 1px solid var(--border);
-  background: rgba(30, 41, 59, 0.55);
-  color: var(--text-1);
-  border-radius: 10px;
-  padding: 8px 15px;
-  font-size: 14px;
-  cursor: pointer;
-  transition: all 0.18s ease;
-  user-select: none;
-  white-space: nowrap;
-}
-.btn:hover {
-  background: rgba(51, 65, 85, 0.85);
-  border-color: rgba(148, 163, 184, 0.4);
-}
-.btn:active { transform: scale(0.96); }
-.btn.sound.muted { opacity: 0.75; border-color: rgba(248, 113, 113, 0.45); }
-.btn.sound.muted svg { color: #f87171; }
-.btn.play {
-  border: none;
-  background: linear-gradient(135deg, #0ea5e9, #22d3ee);
-  color: #03131f;
-  font-weight: 700;
-  min-width: 104px;
-  justify-content: center;
-  box-shadow: 0 6px 24px rgba(34, 211, 238, 0.35);
-}
-.btn.play:hover { filter: brightness(1.08); }
-
-.pgroup { min-width: 150px; display: flex; flex-direction: column; gap: 6px; }
-.pgroup.grow { flex: 1; min-width: 200px; max-width: 440px; }
-.plabel {
-  font-size: 12px;
-  color: var(--text-2);
-  letter-spacing: 0.5px;
-}
-small { font-size: 11px; color: var(--text-3); line-height: 1.4; }
-
-.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 9px; overflow: hidden; }
-.seg button {
-  border: none;
-  background: rgba(15, 23, 42, 0.55);
-  color: var(--text-2);
-  padding: 7px 12px;
-  font-size: 13px;
-  cursor: pointer;
-  transition: all 0.15s;
-}
-.seg button + button { border-left: 1px solid var(--border); }
-.seg button.on { background: linear-gradient(135deg, rgba(14,165,233,0.25), rgba(34,211,238,0.25)); color: #e2e8f0; }
-
-.tick {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  font-size: 12px;
-  color: var(--text-2);
-  cursor: pointer;
-  user-select: none;
-}
-.tick input { accent-color: #22d3ee; width: 14px; height: 14px; cursor: pointer; }
-
-/* 倍速下拉 */
-.speed-select {
-  appearance: none;
-  -webkit-appearance: none;
-  height: 34px;
-  width: 76px;
-  padding: 0 26px 0 10px;
-  border-radius: 9px;
-  border: 1px solid var(--border);
-  background-color: rgba(2, 6, 23, 0.7);
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 9px center;
-  color: var(--text-1);
-  font-size: 14px;
-  font-variant-numeric: tabular-nums;
-  cursor: pointer;
-  outline: none;
-  transition: border 0.15s, box-shadow 0.15s;
-}
-.speed-select:focus {
-  border-color: #38bdf8;
-  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.18);
-}
-.pgroup.inline {
-  flex-direction: row;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-}
-.pgroup.inline .plabel {
-  white-space: nowrap;
-}
-.pgroup.inline small {
-  display: none;
-}
-
-@media (max-width: 1080px) { .btn.sound { display: none; } }
 </style>
