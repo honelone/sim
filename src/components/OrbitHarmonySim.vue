@@ -7,6 +7,7 @@ import SimDock from './SimDock.vue'
  * 各运动点从原点出发沿圆轨运行，每跑完一圈（回到原点）即奏响对应音。
  * 速度：第 n 点每 60s 运行 n 圈（点序即“第几圈/60s”）。
  * 点数可由顶部总控条调整（与其它实验页一致的步进器）。
+ * 额外：任意两个运动点在圆周上相遇（重叠）时，奏响二者对应的和声音程。
  * 头部与半圆弹跳页一致（SimDock）；方向/连线显示控制已取消
  * （连线常显、方向固定逆时针，无切换 UI）。
  * ========================================================= */
@@ -77,14 +78,15 @@ let audioRetryTimer = 0
 let highlightTimer = 0
 let lastResumeProbe = 0
 let pendingNotes = []          // ctx 未就绪时排队待补发的音符
-const audioStats = { builds: 0, unlockCalls: 0, noteAttempts: 0, notesScheduled: 0, notesFlushed: 0, passes: 0 }
+const audioStats = { builds: 0, unlockCalls: 0, noteAttempts: 0, notesScheduled: 0, notesFlushed: 0, passes: 0, overlaps: 0 }
 
 /* ---------- 运行时非响应式数据 ---------- */
 const sim = {
   w: 0, h: 0, dpr: 1,
   cx: 0, cy: 0, R: 0,
-  pts: [],       // 运动点：{ i, num, f }，f∈[0,1) 圈内相位（0=原点）；数量随 countInput 变化
-  ripples: [],   // 经过原点时的冲击波纹
+  pts: [],          // 运动点：{ i, num, f }，f∈[0,1) 圈内相位（0=原点）；数量随 countInput 变化
+  ripples: [],      // 经过原点 / 两点相遇时的冲击波纹
+  pairDelta: {},    // 各点对上一帧的“最短角差”，用于检测圆周相遇（重叠）
 }
 
 // 数量变化时同步运动点数组：尽量保留已有相位，新增点从原点出发
@@ -95,6 +97,7 @@ function syncPoints() {
     const prev = old[i]
     return { i, num: i + 1, f: prev ? prev.f : 0 }
   })
+  sim.pairDelta = {} // 数量变化后重新记录角差，避免误触发重叠
 }
 
 let rafId = 0                  // requestAnimationFrame id
@@ -137,6 +140,7 @@ function reset() {
   playing.value = false
   unlockAudio() // 重置按钮在用户手势内，顺带解锁音频
   sim.ripples.length = 0
+  sim.pairDelta = {} // 重置后所有点回到原点（重合），清空缓存以免开局爆发重叠音
   for (const p of sim.pts) p.f = 0
   activeIdx.value = -1
 }
@@ -215,7 +219,7 @@ function scheduleRetry() {
 function flushPending() {
   if (!pendingNotes.length || !audioCtx || audioCtx.state !== 'running') return
   const batch = pendingNotes.splice(0)
-  for (const i of batch) { try { if (scheduleNoteNow(i)) audioStats.notesFlushed++ } catch (e) {} }
+  for (const note of batch) { try { if (scheduleNoteNow(note.freq, note.soft)) audioStats.notesFlushed++ } catch (e) {} }
 }
 
 // 弹奏单个正弦音（指数衰减，钟琴质感）
@@ -235,29 +239,44 @@ function strike(freq, t0, type, peak, decay) {
   osc.onended = () => { osc.disconnect(); g.disconnect() }
 }
 
-// 真正调度音符：仅在 ctx running 且未静音时执行
-function scheduleNoteNow(i) {
+// 真正调度音符：仅在 ctx running 且未静音时执行；soft=true 用于两点重叠（更轻更短）
+function scheduleNoteNow(freq, soft) {
   if (muted.value || !audioCtx || !masterGain || audioCtx.state !== 'running') return false
   const t0 = audioCtx.currentTime
-  const f = DOTS.value[i].freq
   try {
-    strike(f, t0, 'sine', 0.5, 1.0)              // 基音
-    strike(f * 2.01, t0, 'sine', 0.12, 0.3)     // 八度泛音“叮”
-    strike(f * 4.07, t0, 'sine', 0.05, 0.12)    // 高频亮色
+    if (soft) {
+      strike(freq, t0, 'sine', 0.22, 0.5)         // 重叠：轻
+      strike(freq * 2.01, t0, 'sine', 0.05, 0.18) // 重叠：泛音更弱
+    } else {
+      strike(freq, t0, 'sine', 0.5, 1.0)          // 基音
+      strike(freq * 2.01, t0, 'sine', 0.12, 0.3)  // 八度泛音“叮”
+      strike(freq * 4.07, t0, 'sine', 0.05, 0.12) // 高频亮色
+    }
     audioStats.notesScheduled++
     return true
   } catch (err) { console.warn('音符调度失败', err); return false }
 }
 
-// 第 i 个点经过原点时发声；ctx 未解锁时入队待补发
-function playPassNote(i) {
+// 通用发声：ctx 未解锁时按 {freq, soft} 入队待补发
+function playNote(freq, soft) {
   audioStats.noteAttempts++
   if (muted.value) return
-  if (audioCtx && audioCtx.state === 'running') { scheduleNoteNow(i); return }
+  if (audioCtx && audioCtx.state === 'running') { scheduleNoteNow(freq, !!soft); return }
   if (buildAudioGraph()) {
-    if (pendingNotes.length < 32) pendingNotes.push(i)
+    if (pendingNotes.length < 64) pendingNotes.push({ freq, soft: !!soft })
     unlockAudio()
   }
+}
+
+// 第 i 个点经过原点时发声
+function playPassNote(i) {
+  playNote(DOTS.value[i].freq)
+}
+
+// 任意两点在圆周上相遇（重叠）时：两音同时发声（和声音程）
+function playOverlap(i, j) {
+  playNote(DOTS.value[i].freq, true)
+  playNote(DOTS.value[j].freq, true)
 }
 
 function audioSupervisor() {
@@ -282,6 +301,40 @@ function triggerPass(i) {
   highlightTimer = setTimeout(() => { activeIdx.value = -1 }, 420)
 }
 
+// 两点在圆周上相遇（角位置重合）：标注涟漪 + 奏响对应和声音程
+function triggerOverlap(i, j) {
+  audioStats.overlaps++
+  playOverlap(i, j)
+  const pt = posOf(sim.pts[i].f) // 此刻 i、j 位置重合
+  const hue = (DOTS.value[i].h + DOTS.value[j].h) / 2
+  sim.ripples.push({ x: pt.x, y: pt.y, age: 0, h: hue, kind: 'overlap' })
+  if (sim.ripples.length > 40) sim.ripples.shift()
+}
+
+// 取两相位在圆上“最短有向差” ∈ (-0.5, 0.5]，过零点即两点的圆周相遇
+function shortestDelta(a, b) {
+  let d = ((a - b) % 1 + 1) % 1
+  if (d > 0.5) d -= 1
+  return d
+}
+
+// 检测任意两点是否在圆周上相遇（位置重合），触发重叠音与视觉涟漪
+function detectOverlaps() {
+  const n = sim.pts.length
+  if (n < 2) return
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const d = shortestDelta(sim.pts[i].f, sim.pts[j].f)
+      const key = i * n + j
+      const prev = sim.pairDelta[key]
+      if (prev === undefined) { sim.pairDelta[key] = d; continue }
+      const crossed = (prev < 0) !== (d < 0) && Math.abs(d - prev) < 0.5
+      sim.pairDelta[key] = d
+      if (crossed) triggerOverlap(i, j)
+    }
+  }
+}
+
 function updateSim(dt) {
   const scale = Number(speedScale.value) || 1
   for (const p of sim.pts) {
@@ -294,6 +347,7 @@ function updateSim(dt) {
     }
     p.f = raw - Math.floor(raw)
   }
+  detectOverlaps()
   for (let i = sim.ripples.length - 1; i >= 0; i--) {
     sim.ripples[i].age += dt
     if (sim.ripples[i].age > 0.8) sim.ripples.splice(i, 1)
@@ -390,8 +444,14 @@ function drawRipples(ctx) {
     const rad = 8 + t * (sim.R * 0.16)
     ctx.beginPath()
     ctx.arc(r.x, r.y, rad, 0, Math.PI * 2)
-    ctx.strokeStyle = hsla(r.h ?? DOTS.value[0].h, 92, 68, (1 - t) * 0.7)
-    ctx.lineWidth = 2
+    if (r.kind === 'overlap') {
+      // 两点相遇：白色亮环，区别于原点处的彩色涟漪
+      ctx.strokeStyle = `rgba(255,255,255,${(1 - t) * 0.85})`
+      ctx.lineWidth = 2.4
+    } else {
+      ctx.strokeStyle = hsla(r.h ?? DOTS.value[0].h, 92, 68, (1 - t) * 0.7)
+      ctx.lineWidth = 2
+    }
     ctx.stroke()
   }
   ctx.restore()
