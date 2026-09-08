@@ -1,27 +1,32 @@
 <script setup>
 import { onMounted, onBeforeUnmount, ref, watch, computed } from 'vue'
 import SimDock from './SimDock.vue'
+// 音效定义与播放逻辑已抽离为可复用模块：
+//  - scaleTones.js：基础/降调/升调音阶与 assembleScale 装配
+//  - soundEngine.js：SoundEngine 播放引擎（碰撞时调用 engine.play）
+import { SoundEngine, assembleScale } from '../audio/soundEngine.js'
+import { rainbowColors, hsla, nearestRainbowName } from '../visual/rainbow.js'
 
 /* =========================================================
  * 需求映射：
  *  1. 页面中部绘制固定原点，自原点向左上/右上各引一条对称线段，
  *     两线段夹角可调（默认 135°；单侧相对竖直倾斜 = 夹角/2）
- *  2. 左侧线段上按“距原点由近及远”放 30 个运动点
+ *  2. 左侧线段上按“距原点由近及远”放若干运动点
  *  3. 运动点以原点为圆心、各自到原点的距离为半径，
  *     沿圆弧路径（夹在两线段之间，翻越顶部）从左线段摆到右线段，撞线即折返
- *  4. 变速：60s 内第 1 个点(最内)往返 30 次、第 2 个 29 次 … 第 30 个(最外)1 次
+ *  4. 变速：60s 内第 1 个点(最内)往返 30 次、第 2 个 29 次 … 最外 1 次
  *     （一个往返 = 左线→右线→左线，周期 = 60/n 秒）
- *  5. 各点按彩虹色序（红橙黄绿蓝靛紫）循环着色
+ *  5. 各点按彩虹色序着色：两端点取彩虹两端色，中间按渐变顺序依次标注
  *  6. 顶部/底部信息展示与既有实验页保持同一视觉语言
- *  7. 连线：任意两个运动点之间连线（可选）＋ 每点与原点之间连线，
- *     均比线段路径更淡
- *  8. 运动点撞到任一线段时发声：按点序 do re mi fa sol la si，
- *     每满 7 个点升一个八度循环（点 8 起 do'、点 15 起 do'' …）
+ *  7. 连线：任意两个运动点之间连线（可选）＋ 每点与原点之间连线，均比线段路径更淡
+ *  8. 运动点撞到任一线段时发声：音高由音效模块 assembleScale 给出
+ *     （基础 do..si，超过 7 个按“降调→升调组”依次扩展）
+ *  9. 点的数量最低 7 个，确保 7 个基础音效（do..si）完整播放
  * ========================================================= */
 
 /* ---------- 常量 ---------- */
 const DEFAULT_COUNT = 30        // 默认运动点数量（需求为 30）
-const MIN_COUNT = 2             // UI 下限
+const MIN_COUNT = 7             // UI 下限：确保 7 个基础音效完整播放
 const MAX_COUNT = 40            // UI 上限
 const CYCLE_SECONDS = 60        // 周期基准：60s 内完成“按层分配的往返次数”
 const WEDGE_MIN = 80            // 两线夹角下限（°）
@@ -34,35 +39,12 @@ const CHORD_ALPHA = 0.09        // 点间连线不透明度（< 线段）
 const SPOKE_ALPHA = 0.13        // 点-原点连线不透明度（< 线段）
 const AUDIO_DEBUG = true        // 调试开关
 
-// 自然大调：do re mi fa sol la si（C4~B4）
-const NOTE_FREQS = [261.63, 293.66, 329.63, 349.23, 392.0, 440.0, 493.88]
-const NOTE_NAMES = ['do', 're', 'mi', 'fa', 'sol', 'la', 'si']
-const SUP = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷']
-// 彩虹七色（红橙黄绿蓝靛紫）按点序循环
-const RAINBOW_HUES = [0, 30, 55, 130, 205, 240, 285]
-
-function hsl(h, s, l) { return `hsl(${h}, ${s}%, ${l}%)` }
-function hsla(h, s, l, a) { return `hsla(${h}, ${s}%, ${l}%, ${a})` }
-
 // 第 n 点（n=1 起）在 60s 内完成的往返次数：最内层=总点数，最外层=1，逐层递减
 function cyclesOf(i, n) { return n - i }
 
-function noteOf(i) {
-  const deg = i % 7
-  const oct = Math.floor(i / 7)
-  return {
-    deg,
-    oct,
-    freq: NOTE_FREQS[deg] * Math.pow(2, oct),
-    base: NOTE_NAMES[deg],
-    disp: oct > 0 ? `${NOTE_NAMES[deg]}${SUP[Math.min(oct, SUP.length - 1)]}` : NOTE_NAMES[deg],
-    title: oct > 0 ? `${NOTE_NAMES[deg]}（升 ${oct} 个八度）` : NOTE_NAMES[deg],
-  }
-}
-
 /* ---------- 交互状态 ---------- */
 const count = ref(DEFAULT_COUNT)
-const effCount = computed(() => Math.min(Math.max(Math.round(Number(count.value) || 1), MIN_COUNT), MAX_COUNT))
+const effCount = computed(() => Math.min(Math.max(Math.round(Number(count.value) || MIN_COUNT), MIN_COUNT), MAX_COUNT))
 const wedgeDeg = ref(135)          // 两条线段的夹角（默认 135°）
 const halfRad = computed(() => ((wedgeDeg.value / 2) * Math.PI) / 180)
 const speedScale = ref(1)
@@ -77,36 +59,36 @@ const canvasRef = ref(null)
 const stageRef = ref(null)
 const dockRef = ref(null)   // 顶部总控条（SimDock 组件根，供 layout 测量遮挡高度）
 
-// 每个运动点的元信息（颜色 = 彩虹七色按点序循环；音符 = 七音阶按点序循环升调）
+// 每个运动点的元信息（颜色 = 彩虹两端点 + 中间渐变；音符 = 音效表 assembleScale）
+const scale = computed(() => assembleScale(effCount.value))
 const meta = computed(() =>
   Array.from({ length: effCount.value }, (_, i) => {
-    const h = RAINBOW_HUES[i % 7]
+    const c = rainbowColors(i, effCount.value)
+    const note = scale.value[i]
     const cyc = cyclesOf(i, effCount.value)
-    const note = noteOf(i)
     return {
-      i, num: i + 1, h, cyc,
-      color: hsl(h, 92, 62),
-      light: hsl(h, 96, 82),
-      dark: hsl(h, 88, 44),
-      ...note,
+      i, num: i + 1, h: c.hue, cyc,
+      color: c.color,
+      light: c.light,
+      dark: c.dark,
+      freq: note.freq,
+      deg: note.deg,
+      oct: note.oct,
+      name: note.name,
+      disp: note.disp,
+      title: note.title,
       period: CYCLE_SECONDS / cyc,
       half: (CYCLE_SECONDS / cyc) / 2,
-      title: `第 ${i + 1} 点（第 ${i + 1} 层）：60s 往返 ${cyc} 次 · 音高 ${note.title} · 颜色 ${['红','橙','黄','绿','蓝','靛','紫'][i % 7]}`,
+      colorName: nearestRainbowName(c.hue),
+      titleFull: `第 ${i + 1} 点（第 ${i + 1} 层）：60s 往返 ${cyc} 次 · 音高 ${note.title} · 颜色 ${nearestRainbowName(c.hue)}`,
     }
   })
 )
 
-/* ---------- 音频运行时 ---------- */
-let audioCtx = null
-let masterGain = null
-let noiseBuffer = null
-let resumePromise = null
-let audioRetryTimer = 0
+/* ---------- 音频引擎（可复用模块，见 src/audio/soundEngine.js） ---------- */
+const engine = new SoundEngine({ masterVolume: 0.5, debug: AUDIO_DEBUG })
 let noticeTimer = 0
 let highlightTimer = 0
-let lastResumeProbe = 0
-let pendingNotes = []
-const audioStats = { builds: 0, unlockCalls: 0, collisions: 0, noteAttempts: 0, notesScheduled: 0, notesFlushed: 0 }
 
 /* ---------- 运行时几何/状态 ---------- */
 const sim = {
@@ -171,15 +153,15 @@ function syncDots() {
 }
 
 function setCount(v) {
-  count.value = Math.min(Math.max(Math.round(Number(v) || 1), MIN_COUNT), MAX_COUNT)
+  count.value = Math.min(Math.max(Math.round(Number(v) || MIN_COUNT), MIN_COUNT), MAX_COUNT)
 }
 function stepCount(delta) {
-  setCount((Number(count.value) || 1) + delta)
+  setCount((Number(count.value) || MIN_COUNT) + delta)
 }
 
 function reset() {
   playing.value = false
-  unlockAudio()
+  engine.unlock()
   sim.ripples.length = 0
   for (const p of sim.pts) { p.s = -1; p.dir = 1; p.bounce = -1 }
   realElapsed = 0
@@ -190,196 +172,20 @@ function reset() {
 
 function togglePlay() {
   playing.value = !playing.value
-  unlockAudio()
+  engine.unlock()
 }
 function toggleMute() {
   muted.value = !muted.value
-  unlockAudio()
+  engine.setMuted(muted.value)
+  engine.unlock()
   flashNotice(muted.value ? '声音已关闭（静音）' : '声音已开启', 1400)
 }
 
-/* =========================================================
- * 音频：Web Audio 实时合成（无外部文件）
- * ========================================================= */
-function buildAudioGraph() {
-  if (audioCtx && audioCtx.state !== 'closed') return true
-  if (audioCtx) { audioCtx = null; masterGain = null; noiseBuffer = null }
-  const AC = window.AudioContext || window['webkitAudioContext']
-  if (!AC) { return false }
-  try {
-    audioCtx = new AC()
-    audioCtx.addEventListener('statechange', onAudioStateChange)
-    masterGain = audioCtx.createGain()
-    masterGain.gain.value = 0.5
-    const comp = audioCtx.createDynamicsCompressor()
-    comp.threshold.value = -14
-    comp.knee.value = 18
-    comp.ratio.value = 8
-    comp.attack.value = 0.003
-    comp.release.value = 0.25
-    masterGain.connect(comp)
-    comp.connect(audioCtx.destination)
-
-    const len = Math.floor(audioCtx.sampleRate * 0.06)
-    noiseBuffer = audioCtx.createBuffer(1, len, audioCtx.sampleRate)
-    const data = noiseBuffer.getChannelData(0)
-    for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1
-    audioStats.builds++
-  } catch (err) {
-    console.warn('WebAudio 初始化失败', err)
-    try { audioCtx && audioCtx.close() } catch (e) {}
-    audioCtx = null
-    masterGain = null
-    noiseBuffer = null
-    return false
-  }
-  return true
-}
-
-function onAudioStateChange() {
-  if (!audioCtx) return
-  if (audioCtx.state === 'running') {
-    flushPending()
-    if (audioRetryTimer) { clearTimeout(audioRetryTimer); audioRetryTimer = 0 }
-  }
-}
-
-function unlockAudio() {
-  if (!buildAudioGraph()) return Promise.resolve(false)
-  audioStats.unlockCalls++
-  if (audioCtx.state === 'running') { return Promise.resolve(true) }
-  if (audioCtx.state === 'suspended' && !resumePromise) {
-    resumePromise = audioCtx.resume().then(
-      () => { resumePromise = null; return !!(audioCtx && audioCtx.state === 'running') },
-      () => {
-        resumePromise = null
-        scheduleRetry()
-        return false
-      }
-    )
-  }
-  return resumePromise || Promise.resolve(false)
-}
-function scheduleRetry() {
-  if (audioRetryTimer) return
-  audioRetryTimer = setTimeout(() => {
-    audioRetryTimer = 0
-    if (audioCtx && audioCtx.state === 'suspended') unlockAudio()
-  }, 900)
-}
+// 轻量临时提示（用于静音切换等）
 function flashNotice(text, ms = 2600) {
   if (noticeTimer) clearTimeout(noticeTimer)
   noticeTimer = setTimeout(() => { noticeTimer = 0 }, ms)
   void text
-}
-function flushPending() {
-  if (!pendingNotes.length || !audioCtx || audioCtx.state !== 'running') return
-  const batch = pendingNotes.splice(0)
-  for (const item of batch) {
-    try { if (scheduleNoteNow(item.index, item.pan ?? 0)) audioStats.notesFlushed++ } catch (e) {}
-  }
-}
-
-let stereoPanSupport = null
-function panSupported() {
-  if (stereoPanSupport === null) {
-    const AC = window.AudioContext || window['webkitAudioContext']
-    stereoPanSupport = !!(AC && AC.prototype && typeof AC.prototype.createStereoPanner === 'function')
-  }
-  return stereoPanSupport
-}
-function pannedOut(pan) {
-  const pv = Math.max(-1, Math.min(1, Number(pan) || 0))
-  if (pv !== 0 && panSupported()) {
-    const node = audioCtx.createStereoPanner()
-    node.pan.value = pv
-    node.connect(masterGain)
-    return node
-  }
-  return masterGain
-}
-function strike(freq, t0, type, peak, decay, pan) {
-  if (!audioCtx || !masterGain) return
-  const osc = audioCtx.createOscillator()
-  const g = audioCtx.createGain()
-  const out = pannedOut(pan)
-  osc.type = type
-  osc.frequency.value = freq
-  g.gain.setValueAtTime(0.0001, t0)
-  g.gain.exponentialRampToValueAtTime(peak, t0 + 0.005)
-  g.gain.exponentialRampToValueAtTime(0.0001, t0 + decay)
-  osc.connect(g)
-  g.connect(out)
-  osc.start(t0)
-  osc.stop(t0 + decay + 0.05)
-  osc.onended = () => {
-    osc.disconnect()
-    g.disconnect()
-    if (out !== masterGain) out.disconnect()
-  }
-}
-function noiseHit(t0, dur, pan) {
-  if (!noiseBuffer || !masterGain) return
-  const src = audioCtx.createBufferSource()
-  src.buffer = noiseBuffer
-  const filter = audioCtx.createBiquadFilter()
-  filter.type = 'bandpass'
-  filter.frequency.value = 2600
-  filter.Q.value = 0.8
-  const g = audioCtx.createGain()
-  const out = pannedOut(pan)
-  g.gain.setValueAtTime(0.0001, t0)
-  g.gain.exponentialRampToValueAtTime(0.45, t0 + 0.005)
-  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur)
-  src.connect(filter)
-  filter.connect(g)
-  g.connect(out)
-  src.start(t0)
-  src.stop(t0 + dur + 0.02)
-  src.onended = () => {
-    src.disconnect()
-    filter.disconnect()
-    g.disconnect()
-    if (out !== masterGain) out.disconnect()
-  }
-}
-// index 0 起；pan：-1 左线碰撞(左声道) / 0 居中 / +1 右线碰撞(右声道)
-function scheduleNoteNow(index, pan = 0) {
-  if (muted.value || !audioCtx || !masterGain || audioCtx.state !== 'running') return false
-  const t0 = audioCtx.currentTime
-  const f = meta.value[index].freq
-  try {
-    noiseHit(t0, 0.035, pan)
-    strike(f, t0, 'sine', 0.5, 0.9, pan)
-    strike(f * 2.01, t0, 'sine', 0.12, 0.28, pan)
-    strike(f * 4.07, t0, 'sine', 0.06, 0.1, pan)
-    audioStats.notesScheduled++
-    return true
-  } catch (err) {
-    console.warn('音符调度失败', err)
-    return false
-  }
-}
-function playCollisionNote(index, pan = 0) {
-  audioStats.noteAttempts++
-  if (muted.value) return
-  if (audioCtx && audioCtx.state === 'running') {
-    scheduleNoteNow(index, pan)
-    return
-  }
-  if (buildAudioGraph()) {
-    if (pendingNotes.length < 32) pendingNotes.push({ index, pan })
-    unlockAudio()
-  }
-}
-
-function audioSupervisor() {
-  if (!audioCtx) return
-  if (audioCtx.state === 'closed') { buildAudioGraph(); return }
-  if (audioCtx.state === 'suspended') {
-    const now = performance.now()
-    if (now - lastResumeProbe > 1000) { lastResumeProbe = now; unlockAudio() }
-  }
 }
 
 /* ---------- 运动物理：归一化角位置 s∈[-1,1]，±1 对应左右线段 ---------- */
@@ -395,9 +201,9 @@ function impactAt(i) {
   const y = sim.cy - r * Math.cos(th)
   sim.ripples.push({ x, y, age: 0, h: d.h })
   if (sim.ripples.length > 26) sim.ripples.shift()
-  audioStats.collisions++
   const pan = p.s > 0 ? 1 : -1 // 右线→右声道，左线→左声道
-  playCollisionNote(i, pan)
+  // 对应音符：由音效表按点序给出（基础 do..si → 降调 → 升调组）
+  engine.play(d.freq, pan)
   lastNote.value = { num: d.num, name: d.disp, color: d.color, title: d.title }
   activeIdx.value = i
   clearTimeout(highlightTimer)
@@ -692,11 +498,11 @@ function tick(ts) {
   if (playing.value) {
     updateSim(dt)
   }
-  audioSupervisor()
+  engine.supervisor()
   render()
 }
 
-function onUserGesture() { unlockAudio() }
+function onUserGesture() { engine.unlock() }
 function onKeydown(e) {
   if (e.code === 'Space' && e.target.tagName !== 'INPUT' && e.target.tagName !== 'BUTTON') {
     e.preventDefault()
@@ -725,25 +531,17 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeydown)
   window.removeEventListener('pointerdown', onUserGesture)
   window.removeEventListener('keydown', onUserGesture)
-  clearTimeout(audioRetryTimer)
   clearTimeout(noticeTimer)
   clearTimeout(highlightTimer)
-  if (audioCtx && audioCtx.state !== 'closed') {
-    audioCtx.close().catch(() => {})
-    audioCtx = null
-    masterGain = null
-    noiseBuffer = null
-  }
+  engine.dispose()
 })
 
 if (AUDIO_DEBUG) {
   window.__fanAudio = {
-    get ctxState() { return audioCtx ? audioCtx.state : 'none' },
+    ...engine.snapshot(),
     get playing() { return playing.value },
     get count() { return effCount.value },
     get wedge() { return wedgeDeg.value },
-    stats: audioStats,
-    unlock: () => unlockAudio(),
   }
 }
 </script>
@@ -829,6 +627,7 @@ if (AUDIO_DEBUG) {
   flex: 1 1 auto;
   min-width: 0;
 }
+
 
 
 

@@ -1,6 +1,9 @@
 <script setup>
 import { onMounted, onBeforeUnmount, ref, computed } from 'vue'
 import SimDock from './SimDock.vue'
+// 音效播放逻辑与音阶常量已抽离为可复用模块（见 src/audio）
+import { SoundEngine } from '../audio/soundEngine.js'
+import { BASE_FREQS as NOTE_FREQS, NOTE_NAMES } from '../audio/scaleTones.js'
 
 /* =========================================================
  * 需求映射：
@@ -33,9 +36,7 @@ const AUDIO_DEBUG = true      // 调试开关：true 时暴露 window.__ellipseA
 /* 层 k 的周期数 = 该层点数：19 点层 90s 跑 19 个来回，10 点层跑 10 个。
  * 点数越多 → 越快，与「最快层 19 点、最慢层 10 点」一致，且相邻层仅差一档 */
 
-// 自然大调：do re mi fa sol la si（C4~B4）
-const NOTE_FREQS = [261.63, 293.66, 329.63, 349.23, 392.0, 440.0, 493.88]
-const NOTE_NAMES = ['do', 're', 'mi', 'fa', 'sol', 'la', 'si']
+// 音阶常量（NOTE_FREQS / NOTE_NAMES）已改由 src/audio/scaleTones.js 统一导出
 
 function hsl(h, s, l) { return `hsl(${h}, ${s}%, ${l}%)` }
 function hsla(h, s, l, a) { return `hsla(${h}, ${s}%, ${l}%, ${a})` }
@@ -201,7 +202,7 @@ function layout() {
 /* ---------- 控制 ---------- */
 function reset() {
   playing.value = false
-  unlockAudio()
+  engine.unlock()
   sim.ripples.length = 0
   realElapsed = 0
   virtElapsed = 0
@@ -212,164 +213,45 @@ function reset() {
 
 function togglePlay() {
   playing.value = !playing.value
-  unlockAudio()
+  engine.unlock()
 }
 
 function toggleMute() {
   muted.value = !muted.value
-  unlockAudio()
+  engine.setMuted(muted.value)
+  engine.unlock()
   flashNotice(muted.value ? '声音已关闭（静音）' : '声音已开启', 1400)
 }
 
 // 同层连线默认开启（showLayerChord），不再区分「相邻 / 全部」三种模式
 
-/* =========================================================
- * 音频：Web Audio 实时合成（无外部文件）
- * 经过原点的点极多（145 点 × 各自圈数），故做最小间隔节流，
- * 音高仍严格按“经过原点的先后顺序”依次 do re mi … 升调循环
- * ========================================================= */
-let audioCtx = null
-let masterGain = null
-let resumePromise = null
-let audioRetryTimer = 0
+/* ---------- 音频：由可复用 SoundEngine 负责（见 src/audio/soundEngine.js） ----------
+ * 本页仅负责“何时发声 / 发什么音”，调用 engine.play(freq, pan, opts) 即可。 */
+
+const engine = new SoundEngine({ masterVolume: 0.32, debug: AUDIO_DEBUG })
 let noticeTimer = 0
 let highlightTimer = 0
-let lastResumeProbe = 0
-let pendingSeq = []
-let noteSeq = 0                 // 经过原点的累计序号 → 决定音高
+let noteSeq = 0                 // 经过原点的累计序号（debug 展示用）
 let lastNoteReal = -1           // 上次发声的真实时间（节流用）
-const audioStats = { builds: 0, unlockCalls: 0, noteAttempts: 0, notesScheduled: 0, passes: 0 }
+const stats = { passes: 0 }     // 页面统计；音频链路指标由 engine.snapshot() 暴露
 
-function buildAudioGraph() {
-  if (audioCtx && audioCtx.state !== 'closed') return true
-  if (audioCtx) { audioCtx = null; masterGain = null }
-  const AC = window.AudioContext || window['webkitAudioContext']
-  if (!AC) { return false }
-  try {
-    audioCtx = new AC()
-    audioCtx.addEventListener('statechange', onAudioStateChange)
-    masterGain = audioCtx.createGain()
-    masterGain.gain.value = 0.32
-    const comp = audioCtx.createDynamicsCompressor()
-    comp.threshold.value = -18
-    comp.knee.value = 22
-    comp.ratio.value = 8
-    comp.attack.value = 0.003
-    comp.release.value = 0.25
-    masterGain.connect(comp)
-    comp.connect(audioCtx.destination)
-    audioStats.builds++
-  } catch (err) {
-    console.warn('WebAudio 初始化失败', err)
-    try { audioCtx && audioCtx.close() } catch (e) {}
-    audioCtx = null
-    masterGain = null
-    return false
-  }
-  return true
-}
-
-function onAudioStateChange() {
-  if (!audioCtx) return
-  if (audioCtx.state === 'running') {
-    flushPending()
-    if (audioRetryTimer) { clearTimeout(audioRetryTimer); audioRetryTimer = 0 }
-  }
-}
-
-function unlockAudio() {
-  if (!buildAudioGraph()) return Promise.resolve(false)
-  audioStats.unlockCalls++
-  if (audioCtx.state === 'running') { return Promise.resolve(true) }
-  if (audioCtx.state === 'suspended' && !resumePromise) {
-    resumePromise = audioCtx.resume().then(
-      () => { resumePromise = null; return !!(audioCtx && audioCtx.state === 'running') },
-      () => { resumePromise = null; scheduleRetry(); return false }
-    )
-  }
-  return resumePromise || Promise.resolve(false)
-}
-
-function scheduleRetry() {
-  if (audioRetryTimer) return
-  audioRetryTimer = setTimeout(() => {
-    audioRetryTimer = 0
-    if (audioCtx && audioCtx.state === 'suspended') unlockAudio()
-  }, 900)
-}
-
+// 轻量临时提示（用于静音切换等）
 function flashNotice(text, ms = 2600) {
   if (noticeTimer) clearTimeout(noticeTimer)
   noticeTimer = setTimeout(() => { noticeTimer = 0 }, ms)
   void text
 }
 
-function flushPending() {
-  if (!pendingSeq.length || !audioCtx || audioCtx.state !== 'running') return
-  const batch = pendingSeq.splice(0)
-  for (const seq of batch) {
-    try { if (scheduleNoteNow(seq)) audioStats.notesScheduled++ } catch (e) {}
-  }
-}
-
-// 单个正弦音（指数衰减，钟琴质感）
-function strike(freq, t0, type, peak, decay) {
-  if (!audioCtx || !masterGain) return
-  const osc = audioCtx.createOscillator()
-  const g = audioCtx.createGain()
-  osc.type = type
-  osc.frequency.value = freq
-  g.gain.setValueAtTime(0.0001, t0)
-  g.gain.exponentialRampToValueAtTime(peak, t0 + 0.005)
-  g.gain.exponentialRampToValueAtTime(0.0001, t0 + decay)
-  osc.connect(g)
-  g.connect(masterGain)
-  osc.start(t0)
-  osc.stop(t0 + decay + 0.05)
-  osc.onended = () => { osc.disconnect(); g.disconnect() }
-}
-
-function scheduleNoteNow(seq) {
-  if (muted.value || !audioCtx || !masterGain || audioCtx.state !== 'running') return false
-  const n = noteOf(seq)
-  const t0 = audioCtx.currentTime
-  try {
-    strike(n.freq, t0, 'sine', 0.42, 0.85)
-    strike(n.freq * 2.01, t0, 'sine', 0.1, 0.24)
-    return true
-  } catch (err) {
-    console.warn('音符调度失败', err)
-    return false
-  }
-}
-
-// 某个点撞上圆形轨道：该层发出一种固定音（外层 do、内层依次 re mi… 升调）
+// 某层撞上圆形轨道：该层发出一种固定音（外层 do、内层依次 re mi… 升调）
 function playLayerNote(layer) {
   if (muted.value) return
-  audioStats.noteAttempts++
   const now = performance.now() / 1000
   if (lastNoteReal >= 0 && now - lastNoteReal < MIN_NOTE_GAP) return
   lastNoteReal = now
   const seq = layer - 1
   const n = noteOf(seq)
   lastNote.value = { seq: layer, name: n.name, title: n.title, h: LAYER_META[layer - 1].h }
-  if (audioCtx && audioCtx.state === 'running') {
-    if (scheduleNoteNow(seq)) audioStats.notesScheduled++
-    return
-  }
-  if (buildAudioGraph()) {
-    if (pendingSeq.length < 24) pendingSeq.push(seq)
-    unlockAudio()
-  }
-}
-
-function audioSupervisor() {
-  if (!audioCtx) return
-  if (audioCtx.state === 'closed') { buildAudioGraph(); return }
-  if (audioCtx.state === 'suspended') {
-    const now = performance.now()
-    if (now - lastResumeProbe > 1000) { lastResumeProbe = now; unlockAudio() }
-  }
+  engine.play(n.freq, 0, { impact: false })
 }
 
 /* ---------- 运动：圆形台球（直线飞行 + 入射角 = 反射角） ----------
@@ -408,7 +290,7 @@ function updatePositions() {
 
 // 某个点回到原点（走满 per 段）→ 奏响下一个音
 function triggerPass(d) {
-  audioStats.passes++
+  stats.passes++
   if (sim.ripples.length < 16) {
     sim.ripples.push({ x: originX(), y: originY(), age: 0, h: d.h })
   }
@@ -603,11 +485,11 @@ function tick(ts) {
   if (playing.value) {
     updateSim(dt)
   }
-  audioSupervisor()
+  engine.supervisor()
   render()
 }
 
-function onUserGesture() { unlockAudio() }
+function onUserGesture() { engine.unlock() }
 function onKeydown(e) {
   if (e.code === 'Space' && e.target.tagName !== 'INPUT' && e.target.tagName !== 'BUTTON') {
     e.preventDefault()
@@ -634,25 +516,19 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeydown)
   window.removeEventListener('pointerdown', onUserGesture)
   window.removeEventListener('keydown', onUserGesture)
-  clearTimeout(audioRetryTimer)
   clearTimeout(noticeTimer)
   clearTimeout(highlightTimer)
-  if (audioCtx && audioCtx.state !== 'closed') {
-    audioCtx.close().catch(() => {})
-    audioCtx = null
-    masterGain = null
-  }
+  engine.dispose()
 })
 
 if (AUDIO_DEBUG) {
   window.__ellipseAudio = {
-    get ctxState() { return audioCtx ? audioCtx.state : 'none' },
+    ...engine.snapshot(),
     get playing() { return playing.value },
     get points() { return TOTAL_POINTS },
     get virt() { return virtElapsed },
     get noteSeq() { return noteSeq },
-    stats: audioStats,
-    unlock: () => unlockAudio(),
+    stats,
   }
 }
 </script>

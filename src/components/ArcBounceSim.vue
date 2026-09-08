@@ -1,15 +1,20 @@
 <script setup>
 import { onMounted, onBeforeUnmount, ref, watch, computed } from 'vue'
 import SimDock from './SimDock.vue'
+// 音效定义与播放逻辑已抽离为可复用模块：
+//  - scaleTones.js：基础/降调/升调音阶与 assembleScale 装配
+//  - soundEngine.js：SoundEngine 播放引擎（创建即持有，碰撞时调用 engine.play）
+import { SoundEngine, assembleScale } from '../audio/soundEngine.js'
+import { rainbowColors } from '../visual/rainbow.js'
 
 /* =========================================================
- * 需求映射（各条目见代码注释）：
+ * 需求映射（音频/配色已抽离为可复用模块，见 src/audio、src/visual）：
  *  1. 水平直线贯穿整个画布
  *  2. 中心原点，半径略大于直线宽度
  *  3. 原点向左每隔一段距离等距排列“点”
  *  4. 点的数量由用户输入控制：窗口尺寸变化时数量保持不变，仅手动修改才更新
  *  5. 相邻点间距为固定值 FIXED_SPACING，不可由用户调整；构图随窗口整体等比缩放适配
- *  5b.顶部信息/控制条与底部参数条悬浮于画布之上且可折叠/隐藏，不占用主运行区域
+ *  5b.顶部信息/控制条与底部参数条悬浮于画布之上且可折叠/隐藏
  *  6. 以“点到原点的距离”为半径，画上方半圆弧路径（颜色比直线淡）
  *  7. 播放按钮：点击后点开始运动
  *  8. 各层按“周期”定速：最内层点每 900s 往返 127 次，最外层往返 100 次，
@@ -17,11 +22,13 @@ import SimDock from './SimDock.vue'
  *  9. 从直线一端绕半圆到另一端后原路返回，无限循环
  * 10. 到达端点触线时做弹性压缩/回弹的物理反弹动画
  * 11. 绘制“点与原点”之间的连线，颜色比半圆路径更淡
- * 12. 点触线时发声：按“距原点由近及远”固定分配音高，
- *     do re mi fa sol la si → 超过 7 个则升一个八度继续重复
+ * 12. 点触线时发声：音高由音效模块 assembleScale 依“基础→降调→升调组”给出
+ * 13. 点的数量最低 7 个，确保 7 个基础音效（do..si）完整播放
+ * 14. 每个点用彩虹色区分：两端点取彩虹两端色，中间按渐变顺序标注
  * ========================================================= */
 
 /* ---------- 常量 ---------- */
+const MIN_POINTS = 7           // 点数下限：确保 7 个基础音效（do..si）完整播放
 const FIXED_SPACING = 64          // 点间距固定值 px：不可由用户调整；构图随窗口整体等比缩放适配
 const MAX_DOTS = 40               // 数量的 UI 硬上限（仅约束手动输入，不随窗口尺寸自动回落）
 const LINE_WIDTH = 3              // 主直线宽度 px
@@ -37,9 +44,6 @@ const CYCLE_PERIOD = 900          // 统计周期秒数
 const CYCLE_INNER = 127           // 最内层（距原点最近）每 900s 的往返次数
 const CYCLE_OUTER = 100           // 最外层（距原点最远）每 900s 的往返次数
 const MAX_FRAME = 0.05            // 单帧最大 dt 秒（防止后台切回跳变）
-
-// 音阶（自然大调 do re mi fa sol la si = C4 D4 E4 F4 G4 A4 B4）
-const NOTE_FREQS = [261.63, 293.66, 329.63, 349.23, 392.0, 440.0, 493.88]
 
 /* ---------- 交互状态（响应式） ---------- */
 const countInput = ref(28)         // 用户输入的点数量（默认 28；仅手动修改时变化，不随窗口尺寸变化）
@@ -64,19 +68,17 @@ const sim = {
   ripples: [],     // 触线反弹时的冲击波纹
 }
 
-// Web Audio：音频上下文必须由“用户手势”启动（浏览器自动播放策略）。
-// 创建成功 ≠ 能出声：被策略拦截时 state 停留在 suspended，需反复在用户手势中重试解锁。
+// Web Audio 初始化与播放由可复用的音效引擎负责（详见 src/audio/soundEngine.js）
 const AUDIO_DEBUG = typeof location !== 'undefined' && /[?&]debug(?:=|&|$)/.test(location.search)
-let audioCtx = null
-let masterGain = null
-let noiseBuffer = null
-let resumePromise = null
-let audioRetryTimer = 0
-let lastResumeProbe = 0
-let pendingNotes = []    // 解锁前发生的碰撞音先入队，解锁成功后补发
+// 音效引擎实例：页面只负责“碰撞时调用 engine.play(freq, pan)”
+const engine = new SoundEngine({ masterVolume: 0.6, debug: AUDIO_DEBUG })
+// 与点一一对应的音效表：基础 → 降调 → 升调组，按 assembleScale 顺序依次添加
+const scale = computed(() => assembleScale(effCount.value))
+// 与点一一对应的彩虹配色：两端点取彩虹两端色，中间按渐变顺序标注
+const dotColors = computed(() =>
+  Array.from({ length: effCount.value }, (_, i) => rainbowColors(i, effCount.value))
+)
 let noticeTimer = 0
-// 调试计数器（URL 加 ?debug 后注入 window.__simAudio，便于定位问题）
-const audioStats = { builds: 0, unlockCalls: 0, collisions: 0, noteAttempts: 0, notesScheduled: 0, notesFlushed: 0 }
 
 let rafId = 0
 let lastTs = 0
@@ -89,7 +91,7 @@ let virtElapsed = 0
 
 /* ---------- 数量约束与画布几何（间距固定、数量不受窗口影响） ---------- */
 const effCount = computed(() =>
-  Math.min(Math.max(Math.round(Number(countInput.value) || 1), 1), MAX_DOTS)
+  Math.min(Math.max(Math.round(Number(countInput.value) || MIN_POINTS), MIN_POINTS), MAX_DOTS)
 )
 
 // 最外层半径：逻辑值（effCount × FIXED_SPACING）经视图缩放后的实际显示像素
@@ -153,15 +155,15 @@ function syncDots() {
 }
 
 function setCount(value) {
-  countInput.value = Math.min(Math.max(Math.round(Number(value) || 1), 1), MAX_DOTS)
+  countInput.value = Math.min(Math.max(Math.round(Number(value) || MIN_POINTS), MIN_POINTS), MAX_DOTS)
 }
 function stepCount(delta) {
-  setCount((Number(countInput.value) || 1) + delta)
+  setCount((Number(countInput.value) || MIN_POINTS) + delta)
 }
 
 function reset() {
   playing.value = false
-  unlockAudio() // 空格 R 等用户手势内解锁音频
+  engine.unlock() // 空格 R 等用户手势内解锁音频
   sim.ripples.length = 0
   sim.dots.forEach((p) => {
     p.pos = p.L
@@ -174,246 +176,21 @@ function reset() {
 
 function togglePlay() {
   playing.value = !playing.value
-  unlockAudio() // 播放按钮是用户手势，借此创建并恢复 AudioContext
+  engine.unlock() // 播放按钮是用户手势，借此创建并恢复 AudioContext
 }
 
 function toggleMute() {
   muted.value = !muted.value
-  unlockAudio()
+  engine.setMuted(muted.value)
+  engine.unlock()
   flashNotice(muted.value ? '声音已关闭（静音）' : '声音已开启', 1400)
 }
 
-/* ---------- 音频（碰撞音效，Web Audio 实时合成，无外部资源） ---------- */
-function buildAudioGraph() {
-  // closed（浏览器已关闭/异常结束的旧上下文）必须丢弃重建，否则永久无法出声
-  if (audioCtx && audioCtx.state !== 'closed') return true
-  if (audioCtx) {
-    audioCtx = null
-    masterGain = null
-    noiseBuffer = null
-  }
-  const AC = window.AudioContext || window['webkitAudioContext']
-  if (!AC) {
-    return false
-  }
-  try {
-    audioCtx = new AC()
-    audioCtx.addEventListener('statechange', onAudioStateChange)
-
-    // 总线：音量 + 软限幅，防止多个音同时碰撞时削波
-    masterGain = audioCtx.createGain()
-    masterGain.gain.value = 0.6
-    const comp = audioCtx.createDynamicsCompressor()
-    comp.threshold.value = -14
-    comp.knee.value = 18
-    comp.ratio.value = 8
-    comp.attack.value = 0.003
-    comp.release.value = 0.25
-    masterGain.connect(comp)
-    comp.connect(audioCtx.destination)
-
-    // 预生成 60ms 白噪声缓冲，供“撞击瞬态”复用
-    const len = Math.floor(audioCtx.sampleRate * 0.06)
-    noiseBuffer = audioCtx.createBuffer(1, len, audioCtx.sampleRate)
-    const data = noiseBuffer.getChannelData(0)
-    for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1
-
-    audioStats.builds++
-  } catch (err) {
-    console.warn('WebAudio 初始化失败', err)
-    try { audioCtx && audioCtx.close() } catch (e) {}
-    audioCtx = null
-    masterGain = null
-    noiseBuffer = null
-    return false
-  }
-  return true
-}
-
-function onAudioStateChange() {
-  if (!audioCtx) return
-  if (audioCtx.state === 'running') {
-    flushPending()
-    if (audioRetryTimer) {
-      clearTimeout(audioRetryTimer)
-      audioRetryTimer = 0
-    }
-  }
-}
-
-// 必须在“用户手势”（点击/按键）内调用才能绕过自动播放策略。
-// 被拦截时 ctx 保持 suspended，resume() 被拒 → 定时重试，
-// 用户一旦获得 sticky activation，后续 resume 即可成功。
-function unlockAudio() {
-  if (!buildAudioGraph()) return Promise.resolve(false)
-  audioStats.unlockCalls++
-  if (audioCtx.state === 'running') {
-    return Promise.resolve(true)
-  }
-  if (audioCtx.state === 'suspended' && !resumePromise) {
-    resumePromise = audioCtx.resume().then(
-      () => {
-        resumePromise = null
-        return !!(audioCtx && audioCtx.state === 'running')
-      },
-      () => {
-        resumePromise = null
-        scheduleRetry()
-        return false
-      }
-    )
-  }
-  return resumePromise || Promise.resolve(false)
-}
-
-function scheduleRetry() {
-  if (audioRetryTimer) return
-  audioRetryTimer = setTimeout(() => {
-    audioRetryTimer = 0
-    if (audioCtx && audioCtx.state === 'suspended') unlockAudio()
-  }, 900)
-}
-
+// 轻量临时提示（用于静音切换等），实际展示交由调用方的提示层
 function flashNotice(text, ms = 2600) {
-  // 复用临时提示（此处用于静音切换等），不影响其它逻辑
   if (noticeTimer) clearTimeout(noticeTimer)
   noticeTimer = setTimeout(() => { noticeTimer = 0 }, ms)
-  // 仅触发计时避免未使用告警；实际展示交由调用方的轻量提示
   void text
-}
-
-// 解锁成功后补发之前被拦截的碰撞音
-function flushPending() {
-  if (!pendingNotes.length || !audioCtx || audioCtx.state !== 'running') return
-  const batch = pendingNotes.splice(0)
-  for (const item of batch) {
-    try { if (scheduleNoteNow(item.index, item.pan ?? 0)) audioStats.notesFlushed++ } catch (e) {}
-  }
-}
-
-// —— 左右声道定位 ——
-// 用 StereoPannerNode 把每个碰撞音定位到 −1(全左) ~ +1(全右)；
-// 不支持（旧浏览器）时退化为单声道居中播放，不影响发声。
-let stereoPanSupport = null
-function panSupported() {
-  if (stereoPanSupport === null) {
-    const AC = window.AudioContext || window['webkitAudioContext']
-    stereoPanSupport = !!(AC && AC.prototype && typeof AC.prototype.createStereoPanner === 'function')
-  }
-  return stereoPanSupport
-}
-// 返回本音符的目标输出节点：pan≈0 直接用主总线；否则创建挂到主总线上的 panner
-function pannedOut(pan) {
-  const pv = Math.max(-1, Math.min(1, Number(pan) || 0))
-  if (pv !== 0 && panSupported()) {
-    const node = audioCtx.createStereoPanner()
-    node.pan.value = pv
-    node.connect(masterGain)
-    return node
-  }
-  return masterGain
-}
-
-// 弹奏单个音调（指数衰减，类似木琴/钟琴）；pan：−1 左 / 0 中 / +1 右
-function strike(freq, t0, type, peak, decay, pan) {
-  const osc = audioCtx.createOscillator()
-  const g = audioCtx.createGain()
-  const out = pannedOut(pan)
-  osc.type = type
-  osc.frequency.value = freq
-  g.gain.setValueAtTime(0.0001, t0)
-  g.gain.exponentialRampToValueAtTime(peak, t0 + 0.005)
-  g.gain.exponentialRampToValueAtTime(0.0001, t0 + decay)
-  osc.connect(g)
-  g.connect(out)
-  osc.start(t0)
-  osc.stop(t0 + decay + 0.05)
-  osc.onended = () => {
-    osc.disconnect()
-    g.disconnect()
-    if (out !== masterGain) out.disconnect()
-  }
-}
-
-// 撞击瞬态（短促带通噪声，模拟“触碰直线”的物理感）；pan：−1 左 / 0 中 / +1 右
-function noiseHit(t0, dur, pan) {
-  if (!noiseBuffer || !masterGain) return
-  const src = audioCtx.createBufferSource()
-  src.buffer = noiseBuffer
-  const filter = audioCtx.createBiquadFilter()
-  filter.type = 'bandpass'
-  filter.frequency.value = 2600
-  filter.Q.value = 0.8
-  const g = audioCtx.createGain()
-  const out = pannedOut(pan)
-  g.gain.setValueAtTime(0.0001, t0)
-  g.gain.exponentialRampToValueAtTime(0.45, t0 + 0.005)
-  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur)
-  src.connect(filter)
-  filter.connect(g)
-  g.connect(out)
-  src.start(t0)
-  src.stop(t0 + dur + 0.02)
-  src.onended = () => {
-    src.disconnect()
-    filter.disconnect()
-    g.disconnect()
-    if (out !== masterGain) out.disconnect()
-  }
-}
-
-// 真正调度音符：仅在 ctx 处于 running 且未静音时执行
-// pan：−1 = 左端点碰撞（左声道） / 0 = 居中 / +1 = 右端点碰撞（右声道）
-function scheduleNoteNow(index, pan = 0) {
-  if (muted.value || !audioCtx || !masterGain || audioCtx.state !== 'running') return false
-  const t0 = audioCtx.currentTime
-  const semi = index % 7
-  const oct = Math.floor(index / 7)
-  const f = NOTE_FREQS[semi] * Math.pow(2, oct)
-  try {
-    noiseHit(t0, 0.035, pan)              // 物理撞击瞬态
-    strike(f, t0, 'sine', 0.5, 0.9, pan)  // 基音（较长、更易被听到）
-    strike(f * 2.01, t0, 'sine', 0.12, 0.28, pan) // 八度泛音“叮”
-    strike(f * 4.07, t0, 'sine', 0.06, 0.1, pan)  // 高频亮色
-    audioStats.notesScheduled++
-    return true
-  } catch (err) {
-    console.warn('音符调度失败', err)
-    return false
-  }
-}
-
-// 第 index 个点（距原点由近及远，0 起）触线时发声：
-// 音高 = do re mi fa sol la si 循环，每超过 7 个升一个八度；
-// 声像 = 左端点碰撞→左声道(−1)，右端点碰撞→右声道(+1)。
-// ctx 尚未 running（首次交互未解锁/被策略拦截）时不丢弃：入队等解锁补发。
-function playCollisionNote(index, pan = 0) {
-  audioStats.noteAttempts++
-  if (muted.value) return
-  if (audioCtx && audioCtx.state === 'running') {
-    scheduleNoteNow(index, pan)
-    return
-  }
-  if (buildAudioGraph()) {
-    if (pendingNotes.length < 32) pendingNotes.push({ index, pan })
-    unlockAudio()
-  }
-}
-
-function audioSupervisor() {
-  // ctx 被策略拦截(suspended)时周期重试；异常关闭(closed)时重建
-  if (!audioCtx) return
-  if (audioCtx.state === 'closed') {
-    buildAudioGraph()
-    return
-  }
-  if (audioCtx.state === 'suspended') {
-    const now = performance.now()
-    if (now - lastResumeProbe > 1000) {
-      lastResumeProbe = now
-      unlockAudio()
-    }
-  }
 }
 
 /* ---------- 运动物理 ---------- */
@@ -423,9 +200,9 @@ function impactAtEnd(p, index) {
   const sideX = p.pos <= 0 ? sim.cx + p.d * sim.scale : sim.cx - p.d * sim.scale // 触地点（直线另一端）
   sim.ripples.push({ x: sideX, y: sim.cy, age: 0 })
   if (sim.ripples.length > 24) sim.ripples.shift()
-  audioStats.collisions++
   const pan = p.pos <= 0 ? 1 : -1 // 右端点触线 → 右声道(+1)；左端点触线 → 左声道(−1)
-  playCollisionNote(index, pan)   // 对应音符：距原点最近的=Do，向外依次升调
+  // 对应音符：由音效表按“距原点由近及远”给出（基础 do..si → 降调 → 升调组）
+  engine.play(scale.value[index].freq, pan)
 }
 
 function update(dt) {
@@ -573,7 +350,10 @@ function drawRipples(ctx) {
 }
 
 function drawDots(ctx) {
-  for (const p of sim.dots) {
+  const colors = dotColors.value
+  for (let i = 0; i < sim.dots.length; i++) {
+    const p = sim.dots[i]
+    const c = colors[i]
     const a = p.pos / p.d
     const r = p.d * sim.scale
     const x = sim.cx + r * Math.cos(a)
@@ -588,6 +368,15 @@ function drawDots(ctx) {
       rx = DOT_R * (1 + 0.62 * k)
     }
 
+    // 色晕（用该点自身彩虹色）
+    const glow = ctx.createRadialGradient(x, y, 1, x, y, DOT_R * 2.6)
+    glow.addColorStop(0, `hsla(${c.hue}, 92%, 66%, 0.45)`)
+    glow.addColorStop(1, `hsla(${c.hue}, 92%, 66%, 0)`)
+    ctx.fillStyle = glow
+    ctx.beginPath()
+    ctx.arc(x, y, DOT_R * 2.6, 0, Math.PI * 2)
+    ctx.fill()
+
     ctx.save()
     ctx.translate(x, y)
     ctx.scale(rx / DOT_R, ry / DOT_R)
@@ -595,15 +384,15 @@ function drawDots(ctx) {
     // 边缘环
     ctx.beginPath()
     ctx.arc(0, 0, DOT_R, 0, Math.PI * 2)
-    ctx.strokeStyle = 'rgba(165,243,252,0.85)'
+    ctx.strokeStyle = `hsla(${c.hue}, 96%, 82%, 0.85)`
     ctx.lineWidth = 1.4
     ctx.stroke()
 
     // 球体渐变
     const g = ctx.createRadialGradient(-DOT_R * 0.35, -DOT_R * 0.4, DOT_R * 0.15, 0, 0, DOT_R * 1.2)
     g.addColorStop(0, '#ffffff')
-    g.addColorStop(0.5, '#a5f3fc')
-    g.addColorStop(1, '#0ea5e9')
+    g.addColorStop(0.5, c.light)
+    g.addColorStop(1, c.dark)
     ctx.fillStyle = g
     ctx.beginPath()
     ctx.arc(0, 0, DOT_R, 0, Math.PI * 2)
@@ -654,13 +443,13 @@ function tick(ts) {
   if (playing.value) {
     update(dt)
   }
-  audioSupervisor()
+  engine.supervisor()
   render()
 }
 
 // 任意用户手势（点击/按键）都可能携带可解锁音频的“激活”，捕获它们尽早解锁
 function onUserGesture() {
-  unlockAudio()
+  engine.unlock()
 }
 
 function onKeydown(e) {
@@ -694,24 +483,17 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeydown)
   window.removeEventListener('pointerdown', onUserGesture)
   window.removeEventListener('keydown', onUserGesture)
-  clearTimeout(audioRetryTimer)
   clearTimeout(noticeTimer)
-  if (audioCtx && audioCtx.state !== 'closed') {
-    audioCtx.close().catch(() => {})
-    audioCtx = null
-    masterGain = null
-    noiseBuffer = null
-  }
+  engine.dispose()
 })
 
 // URL 携带 ?debug 时暴露内部状态，便于排查碰撞触发与音频链路
 if (AUDIO_DEBUG) {
   window.__simAudio = {
-    get ctxState() { return audioCtx ? audioCtx.state : 'none' },
-    get muted() { return muted.value },
+    ...engine.snapshot(),
     get playing() { return playing.value },
-    stats: audioStats,
-    unlock: () => unlockAudio(),
+    get count() { return effCount.value },
+    get muted() { return muted.value },
   }
 }
 </script>
@@ -729,7 +511,7 @@ if (AUDIO_DEBUG) {
       :muted="muted"
       :show-count="true"
       :count="countInput"
-      :count-min="1"
+      :count-min="MIN_POINTS"
       :count-max="MAX_DOTS"
       :speed="speedScale"
       @toggle-play="togglePlay"
