@@ -53,6 +53,7 @@ function noteOf(seq) {
 
 // 第 k 层点数：k=1 最外最快 → 19；k=10 最内最慢 → 10
 function countOfLayer(k) { return 20 - k }
+function gcd(a, b) { while (b) { const t = a % b; a = b; b = t } return a }
 
 // 10 层按彩虹色序着色：同层同色，层间红→橙→黄→绿→青→蓝→紫循环
 const LAYER_META = Array.from({ length: LAYER_COUNT }, (_, idx) => {
@@ -69,37 +70,45 @@ const LAYER_META = Array.from({ length: LAYER_COUNT }, (_, idx) => {
 
 /* 145 个运动点 = 10 层，第 k 层有 (20-k) 个点。
  *
- * 运动机理（层椭圆生长 / 反弹 / 收缩）：
- *   每层的形状都与外部椭圆轨道相似，且顶点恒相切于原点：
- *     中心 (ox, oy + ry·f)，半轴 (rx·f, ry·f)，f ∈ [0,1]
- *     f=0 → 整层退化为原点；f=1 → 整层与外轨道重合
- *   层内第 j 个点按参数角 θ = 2π·j/cnt 均匀分布在该层椭圆上：
- *     P = ( ox + rx·f·sinθ , oy + ry·f·(1−cosθ) )
+ * 运动机理（圆形台球：直线飞行 + 入射角 = 反射角）
  *
- *   · 一层一层发散：所有层同时从原点长出，但层周期数 = 点数，
- *     19 点层最快 → 最先撞上外轨道并反弹，随后 18、17 … 10 点层依次到达。
- *   · 同一时间到达：f=1 时整层所有点同时触碰外轨道 → 整层一起反弹（f 转为收缩）。
- *   · 靠下的点更快：|dP/df| = √(rx²sin²θ + ry²(1−cosθ)²)，
- *     θ=0（顶部/原点）为 0，θ=π（底部）最大 = 2·ry —— 越靠下速度越大。
- *   · 回归原点：f 由 1 收缩回 0，整层同时回到原点并奏响一个音。
+ * 1) 发散阶段：第 j 个点从原点沿「弦」直线飞出，首次落点在圆周参数角
+ *      Δ = 2π·q/p   （q = 2j+1，p = 2·点数）
+ *    同一时刻各点进度 u = t/t_hit 相同，故位置 = 原点 + u·(落点 − 原点)，
+ *    即所有点始终均匀落在一个「以原点为中心、按 u 缩放的圆」上 —— 层层扩大。
+ *    速度 = 弦长/t_hit ∝ sin(Δ/2)：Δ 越接近 π（越靠下）弦越长、越快。
+ *    因为速度 ∝ 弦长，整层必定「同一时间」撞上轨道。
+ *
+ * 2) 碰撞反弹：圆内反射的入射角恒定 ⟹ 每次碰撞点在圆周上前进固定圆心角 Δ，
+ *    第 n 个碰撞点 φ(n) = -π/2 + n·Δ，点在其间做匀速直线运动。
+ *    这严格等价于入射角 = 反射角（法线即半径，等弦 ⟹ 等入射角）。
+ *
+ * 3) 回归原点：走满 p 段后恰好绕回原点；90s 内正好走 p 段，故全部同时归零。
+ *    t_hit = 90/p = 90/(2·点数+1)，点数越多 → 碰撞越频繁 → 层越快。
+ *    取 p = 2·点数+1（奇数）：q=2j+1 也为奇数，q/p 永不可能等于 1/2，
+ *    故不存在「直径往返」式的原路返回，每个点都是斜向反弹。
  */
 const DOTS = (() => {
   const out = []
   for (let k = 1; k <= LAYER_COUNT; k++) {
     const cnt = countOfLayer(k)
     const meta = LAYER_META[k - 1]
+    const p = 2 * cnt + 1                 // 90s 内恰走 p 段（闭合）；取奇数以排除直径
     for (let j = 0; j < cnt; j++) {
-      const th = (2 * Math.PI * j) / cnt
+      const q = 2 * j + 1                 // 绕圈数；Δ = 2π·q/p
+      const g = gcd(q, p)
+      const half = (Math.PI * q) / p
       out.push({
         i: out.length,
         layer: k,
         rank: j,
-        theta: th,
-        sin: Math.sin(th),
-        cos: Math.cos(th),
-        cycles: cnt,                      // 90s 内的「发散→回归」次数 = 该层点数
-        // 相对速率系数（f 线性变化时 |dP/df| 的大小，用于说明上慢下快）
-        rate: Math.sqrt(Math.sin(th) ** 2 + (1 - Math.cos(th)) ** 2),
+        q,
+        p,
+        per: p / g,                       // 回到原点所需段数
+        delta: (360 * q) / p,             // 每次弹射跨越的圆心角（°）
+        chord: 2 * Math.sin(half),        // 弦长（单位 R）
+        env: Math.cos(half),              // 包络圆半径系数
+        rate: Math.sin(half),             // 相对速率（∝ 弦长）
         h: meta.h,
         color: meta.color,
         light: meta.light,
@@ -115,16 +124,16 @@ const TOTAL_POINTS = DOTS.length
 const LAYERS = LAYER_META.map((meta) => {
   const members = DOTS.filter((d) => d.layer === meta.k)
   const cnt = members.length
-  const cycles = members[0].cycles
   return {
     k: meta.k,
     h: meta.h,
     color: meta.color,
     count: cnt,
-    cycles,
-    period: CYCLE_SECONDS / cycles,        // 一次「发散→碰撞→回归」的秒数
+    hit: CYCLE_SECONDS / (2 * cnt + 1),              // 相邻两次碰撞的间隔（秒）
     rateMin: Math.min(...members.map((d) => d.rate)),
     rateMax: Math.max(...members.map((d) => d.rate)),
+    envMin: Math.min(...members.map((d) => d.env)),
+    envMax: Math.max(...members.map((d) => d.env)),
   }
 })
 
@@ -155,16 +164,14 @@ const panelEl = ref(null)
 /* ---------- 运行时非响应式数据 ---------- */
 const sim = {
   w: 0, h: 0, dpr: 1,
-  ox: 0, oy: 0,               // 原点 = 外部椭圆轨道最顶部
-  rx: 0, ry: 0,               // 外部椭圆半轴（f=1 时）
+  cx: 0, cy: 0, R: 0,         // 圆形轨道：圆心与半径
   dotR: 4,
   ripples: [],                // 回归原点时的波纹
-  bounces: [],                // 整层撞上外轨道时的冲击圈
-  factor: new Float64Array(LAYER_COUNT), // 各层当前的 f
   pos: new Float64Array(TOTAL_POINTS * 2),
 }
-function originX() { return sim.ox }
-function originY() { return sim.oy }
+// 原点 = 圆形轨道最顶部
+function originX() { return sim.cx }
+function originY() { return sim.cy - sim.R }
 
 let rafId = 0
 let lastTs = 0
@@ -215,11 +222,10 @@ function layout() {
   const regionBottom = Math.max(padT + 120, h - padB)
   const regionH = regionBottom - regionTop
 
-  sim.ox = w / 2
-  sim.oy = regionTop + 12                       // 原点：外部椭圆最顶部
-  sim.ry = Math.max(40, (regionH - 24) / 2)     // 竖直半轴（整条椭圆在原点下方）
-  sim.rx = Math.max(40, Math.min(sim.ry * 1.12, w / 2 - 48))
-  sim.dotR = Math.max(2.4, Math.min(5.4, sim.ry * 0.017))
+  sim.cx = w / 2
+  sim.cy = regionTop + regionH / 2
+  sim.R = Math.max(40, Math.min(w / 2 - 46, regionH / 2 - 10))
+  sim.dotR = Math.max(2.4, Math.min(5.4, sim.R * 0.017))
 }
 
 /* ---------- 控制 ---------- */
@@ -451,52 +457,51 @@ const audioChipTitle = computed(() => {
   return '经过音效由 Web Audio 实时合成；首次使用请点击“试听”或“播放”解锁'
 })
 
-/* ---------- 运动：层椭圆生长 → 整层同时撞上外轨道 → 反弹收缩回原点 ----------
- * 第 k 层的周期 T = 90 / 点数，层内生长系数 f 走三角波：
- *   相位 u ∈ [0,1)：u<0.5 → f = 2u（发散扩大）；u≥0.5 → f = 2(1−u)（反弹后收缩）
- * 点位置：P = ( ox + rx·f·sinθ , oy + ry·f·(1−cosθ) )
- *   f=0 → 原点；f=1 → 整层与外轨道重合（整层同时碰撞 → 反弹）
+/* ---------- 运动：圆形台球（直线飞行 + 入射角 = 反射角） ----------
+ * 第 n 个碰撞点的圆心角：φ(n) = -π/2 + n·Δ，Δ = 2π·q/p
+ * （圆的法线即半径；等弦 ⟹ 各次入射角相同 ⟹ 反射后等角前进，严格满足反射定律）
+ * 点在第 n 段弦上匀速直线飞行，段间在碰撞点瞬间改变方向。
  */
 
-// 第 k 层（1 起）在等效时间 t 的生长系数 f ∈ [0,1]
-function layerFactor(k, t) {
-  const T = CYCLE_SECONDS / LAYERS[k - 1].cycles
-  let u = (t % T) / T
-  if (u < 0) u += 1
-  return u < 0.5 ? u * 2 : 2 * (1 - u)
+// 已走过的总段数（90s 内走满 p 段）
+function segProgress(d, t) {
+  return (t / CYCLE_SECONDS) * d.p
+}
+
+function angleAt(d, n) {
+  return -Math.PI / 2 + n * ((2 * Math.PI * d.q) / d.p)
 }
 
 function updatePositions() {
   const t = virtElapsed
-  const { ox, oy, rx, ry } = sim
+  const { cx, cy, R } = sim
   for (let i = 0; i < TOTAL_POINTS; i++) {
     const d = DOTS[i]
-    const f = sim.factor[d.layer - 1]
-    sim.pos[i * 2] = ox + rx * f * d.sin
-    sim.pos[i * 2 + 1] = oy + ry * f * (1 - d.cos)
+    const sTot = segProgress(d, t)
+    const n = Math.floor(sTot)
+    const u = sTot - n
+    const a = angleAt(d, n)
+    const b = angleAt(d, n + 1)
+    const x0 = cx + R * Math.cos(a)
+    const y0 = cy + R * Math.sin(a)
+    const x1 = cx + R * Math.cos(b)
+    const y1 = cy + R * Math.sin(b)
+    sim.pos[i * 2] = x0 + (x1 - x0) * u
+    sim.pos[i * 2 + 1] = y0 + (y1 - y0) * u
   }
 }
 
-// 整层同时回归原点 → 只奏一个音（同层点同时到达，不重复计数）
-function triggerLayerReturn(k) {
+// 某个点回到原点（走满 per 段）→ 奏响下一个音
+function triggerPass(d) {
   audioStats.passes++
   passed.value++
   playPassNote()
-  const L = LAYERS[k - 1]
   if (sim.ripples.length < 16) {
-    sim.ripples.push({ x: originX(), y: originY(), age: 0, h: L.h })
+    sim.ripples.push({ x: originX(), y: originY(), age: 0, h: d.h })
   }
-  activeIdx.value = k - 1
+  activeIdx.value = d.layer - 1
   clearTimeout(highlightTimer)
   highlightTimer = setTimeout(() => { activeIdx.value = -1 }, 320)
-}
-
-// 整层同时撞上外部椭圆轨道 → 反弹（画一圈冲击波）
-function triggerLayerBounce(k) {
-  const L = LAYERS[k - 1]
-  if (sim.bounces.length < 16) {
-    sim.bounces.push({ age: 0, h: L.h })
-  }
 }
 
 function updateSim(dt) {
@@ -507,28 +512,20 @@ function updateSim(dt) {
   // 跨过一个完整大周期时，音阶从头开始（do re mi …）
   if (Math.floor(virtElapsed / CYCLE_SECONDS) > Math.floor(prev / CYCLE_SECONDS)) noteSeq = 0
 
-  for (let k = 1; k <= LAYER_COUNT; k++) {
-    const T = CYCLE_SECONDS / LAYERS[k - 1].cycles
-    // 回归原点：相位跨过整数个周期
-    const a = Math.floor(prev / T)
-    const b = Math.floor(virtElapsed / T)
+  for (let i = 0; i < TOTAL_POINTS; i++) {
+    const d = DOTS[i]
+    // 每走满 per 段即回到原点一次
+    const a = Math.floor(segProgress(d, prev) / d.per)
+    const b = Math.floor(segProgress(d, virtElapsed) / d.per)
     if (b > a) {
       const n = Math.min(b - a, 4) // 单帧最多补 4 次，避免极端倍速下爆量
-      for (let m = 0; m < n; m++) triggerLayerReturn(k)
+      for (let m = 0; m < n; m++) triggerPass(d)
     }
-    // 撞上外轨道：相位跨过半周期的奇数倍（f 由升转降的顶点）
-    const ba = Math.floor(prev / T + 0.5)
-    const bb = Math.floor(virtElapsed / T + 0.5)
-    if (bb > ba) triggerLayerBounce(k)
   }
 
   for (let i = sim.ripples.length - 1; i >= 0; i--) {
     sim.ripples[i].age += dt
     if (sim.ripples[i].age > 0.7) sim.ripples.splice(i, 1)
-  }
-  for (let i = sim.bounces.length - 1; i >= 0; i--) {
-    sim.bounces[i].age += dt
-    if (sim.bounces[i].age > 0.6) sim.bounces.splice(i, 1)
   }
 }
 
@@ -536,64 +533,43 @@ function updateSim(dt) {
 function render() {
   const canvas = canvasRef.value
   if (!canvas || !sim.w) return
-  for (let k = 1; k <= LAYER_COUNT; k++) sim.factor[k - 1] = layerFactor(k, virtElapsed)
   updatePositions()
   const ctx = canvas.getContext('2d')
   ctx.setTransform(sim.dpr, 0, 0, sim.dpr, 0, 0)
   ctx.clearRect(0, 0, sim.w, sim.h)
   drawRings(ctx)
   drawConnectors(ctx)
-  drawBounces(ctx)
   drawRipples(ctx)
   drawOrigin(ctx)
   drawDots(ctx)
 }
 
-// 外部椭圆轨道（最亮）+ 各层当前所处的相似椭圆（顶点恒在原点）
-function ellipsePath(ctx, f) {
-  const { ox, oy, rx, ry } = sim
-  ctx.beginPath()
-  ctx.ellipse(ox, oy + ry * f, rx * f, ry * f, 0, 0, Math.PI * 2)
-}
-
+// 圆形轨道（最亮）+ 各层的包络圆（所有弦相切的同心圆 = 视觉上的「层」）
 function drawRings(ctx) {
+  const { cx, cy, R } = sim
   ctx.save()
   ctx.lineCap = 'round'
   if (showRings.value) {
-    ellipsePath(ctx, 1)
+    ctx.beginPath()
+    ctx.arc(cx, cy, R, 0, Math.PI * 2)
     ctx.strokeStyle = 'rgba(56,189,248,0.10)'
     ctx.lineWidth = 12
     ctx.stroke()
 
-    ellipsePath(ctx, 1)
+    ctx.beginPath()
+    ctx.arc(cx, cy, R, 0, Math.PI * 2)
     ctx.strokeStyle = `rgba(148,210,253,${RING_ALPHA})`
     ctx.lineWidth = 1.8
     ctx.stroke()
   }
   if (showEnv.value) {
     ctx.lineWidth = 1
-    for (let k = 1; k <= LAYER_COUNT; k++) {
-      const f = sim.factor[k - 1]
-      if (f < 0.02) continue
-      ellipsePath(ctx, f)
-      ctx.strokeStyle = hsla(LAYERS[k - 1].h, 90, 70, LAYER_RING_ALPHA)
+    for (const L of LAYERS) {
+      ctx.beginPath()
+      ctx.arc(cx, cy, R * ((L.envMin + L.envMax) / 2), 0, Math.PI * 2)
+      ctx.strokeStyle = hsla(L.h, 90, 70, LAYER_RING_ALPHA)
       ctx.stroke()
     }
-  }
-  ctx.restore()
-}
-
-// 整层撞上外轨道时的冲击圈（沿外轨道衰减扩散）
-function drawBounces(ctx) {
-  if (!sim.bounces.length) return
-  ctx.save()
-  for (const b of sim.bounces) {
-    const t = Math.min(b.age / 0.6, 1)
-    const f = 1 - t * 0.12
-    ellipsePath(ctx, f)
-    ctx.strokeStyle = hsla(b.h, 95, 76, (1 - t) * 0.55)
-    ctx.lineWidth = 1 + (1 - t) * 2.4
-    ctx.stroke()
   }
   ctx.restore()
 }
@@ -936,11 +912,11 @@ if (AUDIO_DEBUG) {
           v-for="L in LAYERS"
           :key="L.k"
           class="lg-chip"
-          :title="`第 ${L.k} 层：${L.count} 个点均匀分布在层椭圆上 · 90s 内发散→碰撞→回归 ${L.cycles} 次（单程 ${L.period.toFixed(1)}s）· 层内速率比 底部/顶部 = ${(L.rateMax / Math.max(L.rateMin, 1e-6)).toFixed(0)}∶1`"
+          :title="`第 ${L.k} 层：${L.count} 个点均匀分布 · 90s 内弹射 ${2 * L.count} 段并回到原点 · 相邻两次碰撞间隔 ${L.hit.toFixed(2)}s · 层内速率比 最快/最慢 = ${(L.rateMax / Math.max(L.rateMin, 1e-6)).toFixed(1)}∶1`"
         >
           <i class="lg-dot" :style="{ background: L.color }"></i>
           <b>{{ L.count }}</b>
-          <em>{{ L.period.toFixed(1) }}s</em>
+          <em>{{ L.hit.toFixed(2) }}s</em>
         </span>
         <span class="rainbow" title="10 层按彩虹色序着色（红→橙→黄→绿→青→蓝→紫）"></span>
         <span class="lg-note">音效：按经过原点顺序 do re mi fa sol la si，超 7 个升调循环</span>
