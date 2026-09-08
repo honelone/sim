@@ -123,7 +123,7 @@ let resizeObserver = null
 let realElapsed = 0
 let virtElapsed = 0
 
-/* ---------- 布局：原点居中，V 形与圆弧整体位于上半区 ---------- */
+/* ---------- 布局：原点下移、V 形与圆弧整体偏低且略放大 ---------- */
 function layout() {
   const canvas = canvasRef.value
   const stage = stageRef.value
@@ -146,10 +146,13 @@ function layout() {
   const regionBottom = Math.max(padT + 120, h - padB)
 
   sim.cx = w / 2
-  sim.cy = regionTop + (regionBottom - regionTop) / 2
+  // 整体向下移动：原点锚点从区域垂直中心(0.5)下移到 3/4 处（即向下移动“到区域底部距离的一半”）
+  const regionH = regionBottom - regionTop
+  sim.cy = regionTop + regionH * 0.75
 
   const sinH = Math.sin(halfRad.value)
-  const rVert = sim.cy - padT - 26
+  // 以“移动前”的可用半径为基准适量放大（×1.2），确保图形确实整体下移、而非仅因放大又顶回顶部
+  const rVert = Math.max(40, (regionH * 0.5 - 26) * 1.2)
   const rHoriz = sinH > 0.001 ? (w / 2 - 46) / sinH : w / 2
   sim.R = Math.max(40, Math.min(rVert, rHoriz))
   sim.segLen = sim.R + Math.min(34, sim.R * 0.1)

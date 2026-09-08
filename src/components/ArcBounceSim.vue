@@ -113,11 +113,15 @@ function layout() {
   canvas.width = Math.round(w * dpr)
   canvas.height = Math.round(h * dpr)
   sim.cx = w / 2
-  sim.cy = h * LINE_Y_RATIO
+  // 整体向下移动：基线从 0.58h 下移到“距页面底部一半距离”处（即向下移动“到页面底部距离的一半”）
+  const baseY = h * LINE_Y_RATIO
+  sim.cy = baseY + (h - baseY) / 2
 
   // 顶部总控条已合并为一条：直接测量它实际遮挡的顶部高度（含与顶部的间距）
   const topPad = dockRef.value && dockRef.value.root ? dockRef.value.root.getBoundingClientRect().bottom - rect.top : 96
-  sim.availR = Math.max(40, Math.min(w / 2 - 48, sim.cy - topPad - 16))
+  // 以“移动前”的可用半径为基准适量放大（×1.2），确保图形确实整体下移、而非仅因放大顶回顶部
+  const baseAvail = Math.max(40, baseY - topPad - 16)
+  sim.availR = Math.max(40, Math.min(w / 2 - 40, baseAvail * 1.2))
 
   // 注意：不再按窗口回落/压缩点数——数量与间距都保持用户设定
   syncDots()
