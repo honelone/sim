@@ -46,8 +46,6 @@ const speedScale = ref(1)          // 演示倍速：整体缩放周期节奏，
 const playing = ref(false)         // 是否播放
 const muted = ref(false)           // 是否静音（默认有声）
 const viewScale = ref(1)           // 整体视图缩放（0~1）：把“固定间距×数量”的构图等比适配进可视区
-const headerOpen = ref(true)       // 顶部信息/控制条是否展开
-const panelOpen = ref(true)        // 底部参数条是否展开
 
 // 音频解锁状态：idle | starting | ready | blocked | unsupported
 const audioState = ref('idle')
@@ -166,19 +164,10 @@ function stepCount(delta) {
 // 即 ×N 下 900s/N 的真实时长就对应规则里的 900s
 let realElapsed = 0
 let virtElapsed = 0
-let lastLabelTick = 0
-const timeReal = ref('00:00.0')
-const timeVirt = ref('00:00.0')
 
 // —— 时间定位（seek）状态 ——
 const seekText = ref('00:00') // 输入框文本，格式 mm:ss 或纯秒数
 
-function fmtClock(s) {
-  const m = Math.floor(s / 60)
-  const sec = Math.floor(s % 60)
-  const t = Math.floor((s * 10) % 10)
-  return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}.${t}`
-}
 function fmtMMSS(s) {
   const m = Math.floor(s / 60)
   const sec = Math.floor(s % 60)
@@ -235,9 +224,6 @@ function seekEq(secsRaw, quiet = false) {
   const scale = Number(speedScale.value) || 1
   virtElapsed = clamped
   realElapsed = clamped / scale // 保持“等效 = 实际 × 倍速”的口径
-  lastLabelTick = 0
-  timeVirt.value = fmtClock(clamped)
-  timeReal.value = fmtClock(clamped / scale)
   seekText.value = fmtMMSS(clamped)
   render()
 }
@@ -274,9 +260,6 @@ function reset() {
   })
   realElapsed = 0
   virtElapsed = 0
-  lastLabelTick = 0
-  timeReal.value = '00:00.0'
-  timeVirt.value = '00:00.0'
   seekText.value = '00:00'
 }
 
@@ -823,12 +806,6 @@ function tick(ts) {
   lastTs = ts
   if (playing.value) {
     update(dt)
-    // 计时标签每 ~100ms 刷新一次（避免每帧触发 Vue 重渲染）
-    if (ts - lastLabelTick >= 100) {
-      lastLabelTick = ts
-      timeReal.value = fmtClock(realElapsed)
-      timeVirt.value = fmtClock(virtElapsed)
-    }
   }
   audioSupervisor()
   render()
@@ -851,10 +828,6 @@ function onKeydown(e) {
 watch(countInput, () => {
   syncDots()
   applyViewScale()
-})
-// 顶部/底部悬浮条收起或展开后，可视半径变化 → 重新做等比适配
-watch([headerOpen, panelOpen], () => {
-  layout()
 })
 
 onMounted(() => {
@@ -907,16 +880,9 @@ if (AUDIO_DEBUG) {
 
       <!-- ============ 顶部总控条：标题/状态/操作 + 参数 合并为一条悬浮卡片 ============ -->
       <div class="dock" ref="dockEl">
-        <!-- 第一行：标题（左） + 状态与操作（右）；中间留白，避开顶部居中的页面切换器 -->
-        <header v-if="headerOpen" class="dock-head">
-        <h1>半圆往返 · 弹性反弹 · 音阶碰撞</h1>
+        <!-- 第一行：状态与操作（已移除标题、计时与计数显示） -->
+        <header class="dock-head">
         <div class="header-actions">
-          <span class="clock-chip" title="播放自开始/重置以来的实际流逝时间（暂停期间不计）">
-            <b>运行</b><em>{{ timeReal }}</em>
-          </span>
-          <span class="clock-chip" title="等效周期时间 = 实际时间 × 倍速。×1 时到 15:00 即对应规则中的 900s：最内层往返 127 次、最外层 100 次；倍速越高到点越快">
-            <b>等效</b><em>{{ timeVirt }}</em><span class="clock-den">/15:00</span>
-          </span>
           <span class="seek-chip">
             <b class="seek-label">定位</b>
             <input
@@ -980,38 +946,11 @@ if (AUDIO_DEBUG) {
             </svg>
             {{ playing ? '暂停' : '播放' }}
           </button>
-          <button class="icon-btn collapse" title="收起顶部信息栏" @click="headerOpen = false">
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6" /></svg>
-          </button>
         </div>
       </header>
 
-        <!-- 第一行收起后的极简状态条 -->
-        <div v-else class="dock-head mini-top">
-        <button class="icon-btn" title="展开顶部信息栏" @click="headerOpen = true">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
-        </button>
-        <span class="mini-state" :class="{ running: playing }"><i></i>{{ playing ? '运行中' : '已暂停' }}</span>
-        <span class="mini-clock"><b>运行</b>{{ timeReal }}</span>
-        <span class="mini-clock"><b>等效</b>{{ timeVirt }} / 15:00</span>
-        <span class="mini-note">点数 {{ effCount }} · 最远半径 {{ radiusOuter }}px</span>
-        <button class="btn ghost mini-reset" @click="reset" title="重置 (R)">
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7" /><path d="M3 4v5h5" /></svg>
-          重置
-        </button>
-        <button class="mini-play" :class="{ paused: !playing }" @click="togglePlay" title="播放/暂停 (空格)">
-          <svg v-if="playing" viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
-            <rect x="6" y="5" width="4" height="14" rx="1" /><rect x="14" y="5" width="4" height="14" rx="1" />
-          </svg>
-          <svg v-else viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
-            <path d="M8 5.5v13a1 1 0 0 0 1.5.9l11-6.5a1 1 0 0 0 0-1.8l-11-6.5A1 1 0 0 0 8 5.5Z" />
-          </svg>
-          {{ playing ? '暂停' : '播放' }}
-        </button>
-      </div>
-
         <!-- 第二行：原底部参数条 -->
-        <section v-if="panelOpen" class="dock-body">
+        <section class="dock-body">
         <div class="panel-row">
           <div class="pgroup">
             <span class="plabel">点的数量</span>
@@ -1046,16 +985,8 @@ if (AUDIO_DEBUG) {
             </div>
             <small>最内层每 900s 往返 127 次 → 最外层 100 次（按层线性过渡，内快外慢）</small>
           </div>
-          <button class="icon-btn collapse" title="收起底部参数栏" @click="panelOpen = false">
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
-          </button>
         </div>
       </section>
-
-      <button v-else class="panel-fab" title="展开底部参数栏" @click="panelOpen = true">
-        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1Z" /></svg>
-        参数
-      </button>
     </div>
   </div>
 </template>
@@ -1100,58 +1031,19 @@ if (AUDIO_DEBUG) {
 .dock-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: center;
   gap: 14px;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   min-height: 44px;
   padding: 8px 0;
-}
-.dock-head h1 {
-  font-size: 17px;
-  font-weight: 700;
-  letter-spacing: 0.3px;
-  white-space: nowrap;
-  flex: none;
-  background: linear-gradient(90deg, #e0f2fe, #7dd3fc 60%, #22d3ee);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
 }
 .header-actions {
   display: flex;
   gap: 10px;
   align-items: center;
-  flex-wrap: nowrap;
-  justify-content: flex-end;
+  flex-wrap: wrap;
+  justify-content: center;
   min-width: 0;
-}
-.clock-chip {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 5px;
-  font-size: 12px;
-  padding: 5px 10px;
-  border-radius: 999px;
-  border: 1px solid rgba(56, 189, 248, 0.28);
-  background: rgba(15, 23, 42, 0.55);
-  color: var(--text-2);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-.clock-chip b {
-  color: var(--text-3);
-  font-weight: 500;
-}
-.clock-chip em {
-  color: #7dd3fc;
-  font-style: normal;
-  font-weight: 600;
-}
-.clock-den {
-  color: var(--text-3);
-  font-size: 11px;
-  font-weight: 500;
-  margin-left: 1px;
 }
 .seek-chip {
   display: inline-flex;
@@ -1323,85 +1215,6 @@ if (AUDIO_DEBUG) {
   background: rgba(56, 189, 248, 0.12);
 }
 
-/* ---------- 顶部信息栏收起后的极简状态条 ---------- */
-.mini-top {
-  gap: 10px;
-  padding: 7px 0;
-  flex-wrap: wrap;
-}
-.mini-state {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--text-2);
-  white-space: nowrap;
-}
-.mini-state i {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--text-3);
-}
-.mini-state.running i {
-  background: #4ade80;
-  animation: pulse 1.4s infinite;
-}
-.mini-clock {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 5px;
-  font-size: 12px;
-  color: #7dd3fc;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-  border: 1px solid rgba(56, 189, 248, 0.28);
-  background: rgba(15, 23, 42, 0.55);
-  padding: 4px 10px;
-  border-radius: 999px;
-}
-.mini-clock b {
-  color: var(--text-3);
-  font-weight: 500;
-}
-.mini-note {
-  flex: 1;
-  min-width: 220px;
-  text-align: right;
-  font-size: 12px;
-  color: var(--text-3);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.mini-play {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  border: none;
-  background: linear-gradient(135deg, #0ea5e9, #22d3ee);
-  color: #03131f;
-  font-weight: 700;
-  border-radius: 999px;
-  padding: 7px 14px;
-  font-size: 13px;
-  min-width: 86px;
-  cursor: pointer;
-}
-.mini-play:active {
-  transform: scale(0.96);
-}
-.mini-reset {
-  padding: 6px 12px;
-  border-radius: 999px;
-}
-
-@keyframes pulse {
-  0% { box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.55); }
-  70% { box-shadow: 0 0 0 7px rgba(74, 222, 128, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(74, 222, 128, 0); }
-}
 
 /* 第二行：原底部参数条，与第一行上下堆叠 */
 .dock-body {
@@ -1416,32 +1229,6 @@ if (AUDIO_DEBUG) {
   align-items: flex-end;
   gap: clamp(16px, 3vw, 34px);
   flex-wrap: wrap;
-}
-.panel-row .collapse { margin-left: auto; align-self: flex-start; flex: none; }
-.panel-fab {
-  align-self: flex-end;
-  margin: 0 0 9px;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  border: 1px solid rgba(56, 189, 248, 0.4);
-  background: rgba(15, 23, 42, 0.78);
-  color: #7dd3fc;
-  border-radius: 999px;
-  padding: 8px 14px;
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  backdrop-filter: blur(8px);
-  box-shadow: 0 4px 18px rgba(2, 6, 23, 0.4);
-  transition: all 0.15s;
-}
-.panel-fab:hover {
-  background: rgba(56, 189, 248, 0.16);
-  border-color: #38bdf8;
-}
-.panel-fab svg {
-  flex: none;
 }
 .pgroup {
   min-width: 150px;
@@ -1562,14 +1349,8 @@ output {
   }
 }
 @media (max-width: 1080px) {
-  .dock-head .seek-label,
-  .dock-head .clock-chip {
+  .dock-head .seek-label {
     display: none;
   }
-}
-/* 窄屏：第一行允许换行（标题独占一行），避免与顶部切换器抢空间 */
-@media (max-width: 820px) {
-  .dock-head { flex-wrap: wrap; justify-content: center; }
-  .dock-head h1 { width: 100%; text-align: center; }
 }
 </style>
