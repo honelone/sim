@@ -13,8 +13,8 @@ import { onMounted, onBeforeUnmount, ref, computed, watch, nextTick } from 'vue'
  *     → 0s 全部从原点出发，90s 全部同时回归原点
  *  5. 同层同色，10 层按彩虹色序着色
  *  6. 顶部/底部信息展示与既有页面同一视觉语言
- *  7. 连线：各点之间 + 各点─原点，均比椭圆轨道更淡
- *  8. 经过原点发声：按经过顺序 do re mi fa sol la si，超 7 个升调循环
+ *  7. 连线：仅同一层内、按 rank 相邻的运动点相连（两端端点不连），比圆形路径更淡
+ *  8. 撞轨道发声：与圆形轨道碰撞时发声，每层一种固定音（外层 do … 内层依次递增）；回归原点不发声
  * ========================================================= */
 
 /* ---------- 常量 ---------- */
@@ -23,8 +23,7 @@ const CYCLE_SECONDS = 90      // 大周期：0s 出发，90s 全部回归原点
 const MAX_FRAME = 0.05        // 单帧最大 dt
 const RING_ALPHA = 0.5        // 外部椭圆轨道不透明度（最亮）
 const LAYER_RING_ALPHA = 0.2  // 各层当前椭圆（< RING_ALPHA，> 连线）
-const SPOKE_ALPHA = 0.13      // 点─原点连线（< RING_ALPHA）
-const CHORD_ALPHA = 0.08      // 点间连线（< RING_ALPHA）
+const LAYER_CHORD_ALPHA = 0.22   // 同层内相邻点连线（比圆形路径更淡，但清晰可见）
 const ORIGIN_R = 7            // 原点半径
 const MIN_NOTE_GAP = 0.11     // 相邻发声最小真实间隔（层回归约 1.6 次/秒）
 const DEFAULT_SPEED = 0.5     // 默认倍速（整体放慢，便于观察一层层的发散）
@@ -143,8 +142,7 @@ const playing = ref(false)
 const muted = ref(false)
 const headerOpen = ref(true)
 const panelOpen = ref(true)
-const chordMode = ref('adjacent')   // off | adjacent | full
-const showSpoke = ref(true)
+const showLayerChord = ref(true)   // 同层内相邻点连线（两端端点不连）
 const showRings = ref(true)         // 是否绘制圆形路径
 const showEnv = ref(true)           // 是否绘制各层包络圆
 const lastNote = ref(null)
@@ -257,9 +255,7 @@ function toggleMute() {
 
 const progress = computed(() => Math.min(virtElapsed / CYCLE_SECONDS, 1))
 const virtLabel = computed(() => fmtMMSS(virtElapsed % CYCLE_SECONDS))
-const chordModeText = computed(() => {
-  return chordMode.value === 'full' ? '全部两两' : chordMode.value === 'adjacent' ? '相邻点' : '关闭'
-})
+// 同层连线默认开启（showLayerChord），不再区分「相邻 / 全部」三种模式
 
 /* =========================================================
  * 音频：Web Audio 实时合成（无外部文件）
@@ -385,16 +381,16 @@ function scheduleNoteNow(seq) {
   }
 }
 
-// 某个点经过原点：按经过顺序取下一个音（节流避免 145 点同时回归时爆音）
-function playPassNote() {
-  audioStats.noteAttempts++
+// 某个点撞上圆形轨道：该层发出一种固定音（外层 do、内层依次 re mi… 升调）
+function playLayerNote(layer) {
   if (muted.value) return
+  audioStats.noteAttempts++
   const now = performance.now() / 1000
   if (lastNoteReal >= 0 && now - lastNoteReal < MIN_NOTE_GAP) return
   lastNoteReal = now
-  const seq = noteSeq++ // 被节流丢弃的经过不消耗音序号，保证音阶连续
+  const seq = layer - 1
   const n = noteOf(seq)
-  lastNote.value = { seq: seq + 1, name: n.name, title: n.title, h: (seq * 51) % 360 }
+  lastNote.value = { seq: layer, name: n.name, title: n.title, h: LAYER_META[layer - 1].h }
   if (audioCtx && audioCtx.state === 'running') {
     if (scheduleNoteNow(seq)) audioStats.notesScheduled++
     return
@@ -452,9 +448,9 @@ const audioChipTitle = computed(() => {
     return '浏览器自动播放策略拦截了本站音频。请连续点击“试听”1~2 次（点击本身即解锁动作）；若仍失败，请点击地址栏左侧图标将本站设为“允许声音”'
   }
   if (audioState.value === 'ready') {
-    return '音频已就绪：Web Audio 实时合成（无外部文件）。经过原点的点极多，已按最小间隔节流，音高仍严格依次 do re mi fa sol la si 升调循环'
+    return '音频已就绪：Web Audio 实时合成（无外部文件）。与圆形轨道碰撞时发声，每层一种固定音、由外到内 do re mi… 依次递增；回归原点不发声'
   }
-  return '经过音效由 Web Audio 实时合成；首次使用请点击“试听”或“播放”解锁'
+  return '撞轨道音效由 Web Audio 实时合成；首次使用请点击“试听”或“播放”解锁'
 })
 
 /* ---------- 运动：圆形台球（直线飞行 + 入射角 = 反射角） ----------
@@ -495,7 +491,6 @@ function updatePositions() {
 function triggerPass(d) {
   audioStats.passes++
   passed.value++
-  playPassNote()
   if (sim.ripples.length < 16) {
     sim.ripples.push({ x: originX(), y: originY(), age: 0, h: d.h })
   }
@@ -512,16 +507,28 @@ function updateSim(dt) {
   // 跨过一个完整大周期时，音阶从头开始（do re mi …）
   if (Math.floor(virtElapsed / CYCLE_SECONDS) > Math.floor(prev / CYCLE_SECONDS)) noteSeq = 0
 
+  const hitLayers = new Set()
   for (let i = 0; i < TOTAL_POINTS; i++) {
     const d = DOTS[i]
-    // 每走满 per 段即回到原点一次
-    const a = Math.floor(segProgress(d, prev) / d.per)
-    const b = Math.floor(segProgress(d, virtElapsed) / d.per)
+    const prevF = Math.floor(segProgress(d, prev))
+    const nowF = Math.floor(segProgress(d, virtElapsed))
+    // 每走满 per 段即回到原点一次（仅视觉波纹，不发声）
+    const a = Math.floor(prevF / d.per)
+    const b = Math.floor(nowF / d.per)
     if (b > a) {
       const n = Math.min(b - a, 4) // 单帧最多补 4 次，避免极端倍速下爆量
       for (let m = 0; m < n; m++) triggerPass(d)
     }
+    // 与圆形轨道碰撞：跨过整数段且落点并非原点（段索引不是 p 的倍数）→ 该层发声
+    if (nowF > prevF) {
+      const steps = Math.min(nowF - prevF, 4)
+      for (let m = 1; m <= steps; m++) {
+        const seg = prevF + m         // 刚完成的这一段（1 起）
+        if (seg % d.p !== 0) hitLayers.add(d.layer)   // seg%p===0 表示已回到原点
+      }
+    }
   }
+  for (const layer of hitLayers) playLayerNote(layer)
 
   for (let i = sim.ripples.length - 1; i >= 0; i--) {
     sim.ripples[i].age += dt
@@ -574,46 +581,20 @@ function drawRings(ctx) {
   ctx.restore()
 }
 
-// 连线：各点─原点 + 各点之间（均比椭圆轨道更淡）
+// 连线：仅同一层内、按 rank 相邻的运动点相连；每一层左右两个端点之间不连接
 function drawConnectors(ctx) {
-  const ox = originX()
-  const oy = originY()
+  if (!showLayerChord.value) return
   const pos = sim.pos
   ctx.save()
   ctx.lineCap = 'round'
-
-  if (showSpoke.value) {
-    ctx.lineWidth = 1
-    for (let i = 0; i < TOTAL_POINTS; i++) {
-      ctx.strokeStyle = hsla(DOTS[i].h, 92, 68, SPOKE_ALPHA)
-      ctx.beginPath()
-      ctx.moveTo(ox, oy)
-      ctx.lineTo(pos[i * 2], pos[i * 2 + 1])
-      ctx.stroke()
-    }
-  }
-
-  if (chordMode.value === 'adjacent') {
-    ctx.lineWidth = 0.8
-    ctx.strokeStyle = `rgba(190,214,255,${CHORD_ALPHA})`
+  ctx.lineWidth = 1
+  for (let i = 1; i < TOTAL_POINTS; i++) {
+    if (DOTS[i].layer !== DOTS[i - 1].layer) continue   // 仅同层相连；层间与层首尾端点不连
+    const h = DOTS[i].h
+    ctx.strokeStyle = hsla(h, 90, 72, LAYER_CHORD_ALPHA)
     ctx.beginPath()
-    for (let i = 0; i < TOTAL_POINTS - 1; i++) {
-      ctx.moveTo(pos[i * 2], pos[i * 2 + 1])
-      ctx.lineTo(pos[(i + 1) * 2], pos[(i + 1) * 2 + 1])
-    }
-    ctx.stroke()
-  } else if (chordMode.value === 'full') {
-    ctx.lineWidth = 0.6
-    ctx.strokeStyle = `rgba(190,214,255,${CHORD_ALPHA * 0.7})`
-    ctx.beginPath()
-    for (let i = 0; i < TOTAL_POINTS; i++) {
-      const ax = pos[i * 2]
-      const ay = pos[i * 2 + 1]
-      for (let j = i + 1; j < TOTAL_POINTS; j++) {
-        ctx.moveTo(ax, ay)
-        ctx.lineTo(pos[j * 2], pos[j * 2 + 1])
-      }
-    }
+    ctx.moveTo(pos[(i - 1) * 2], pos[(i - 1) * 2 + 1])
+    ctx.lineTo(pos[i * 2], pos[i * 2 + 1])
     ctx.stroke()
   }
   ctx.restore()
@@ -885,21 +866,11 @@ if (AUDIO_DEBUG) {
         </div>
 
         <div class="pgroup">
-          <span class="plabel">点间连线</span>
-          <div class="seg">
-            <button class="seg-btn" :class="{ on: chordMode === 'off' }" @click="chordMode = 'off'" title="不绘制点间连线">关闭</button>
-            <button class="seg-btn" :class="{ on: chordMode === 'adjacent' }" @click="chordMode = 'adjacent'" title="按速度顺序连接相邻的两个点（144 条，性能友好）">相邻点</button>
-            <button class="seg-btn" :class="{ on: chordMode === 'full' }" @click="chordMode = 'full'" title="145 个点两两相连（10440 条，可能影响帧率）">全部</button>
-          </div>
-          <small>连线比圆形路径更淡</small>
-        </div>
-
-        <div class="pgroup">
           <span class="plabel">显示开关</span>
-          <label class="tick"><input type="checkbox" v-model="showSpoke" />各点─原点连线</label>
+          <label class="tick"><input type="checkbox" v-model="showLayerChord" />同层相邻点连线</label>
           <label class="tick"><input type="checkbox" v-model="showRings" />圆形路径</label>
           <label class="tick"><input type="checkbox" v-model="showEnv" />各层椭圆</label>
-          <small>共 {{ TOTAL_POINTS }} 点 · 当前 {{ chordModeText }}</small>
+          <small>共 {{ TOTAL_POINTS }} 点 · 仅同层相邻点相连（两端端点不连）</small>
         </div>
         <button class="icon-btn collapse" title="收起底部控制栏" @click="panelOpen = false">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
@@ -912,7 +883,7 @@ if (AUDIO_DEBUG) {
           v-for="L in LAYERS"
           :key="L.k"
           class="lg-chip"
-          :title="`第 ${L.k} 层：${L.count} 个点均匀分布 · 90s 内弹射 ${2 * L.count} 段并回到原点 · 相邻两次碰撞间隔 ${L.hit.toFixed(2)}s · 层内速率比 最快/最慢 = ${(L.rateMax / Math.max(L.rateMin, 1e-6)).toFixed(1)}∶1`"
+          :title="`第 ${L.k} 层：${L.count} 个点均匀分布 · 90s 内弹射 ${2 * L.count + 1} 段并回到原点 · 相邻两次碰撞间隔 ${L.hit.toFixed(2)}s · 层内速率比 最快/最慢 = ${(L.rateMax / Math.max(L.rateMin, 1e-6)).toFixed(1)}∶1`"
         >
           <i class="lg-dot" :style="{ background: L.color }"></i>
           <b>{{ L.count }}</b>
