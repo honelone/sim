@@ -5,7 +5,7 @@ import SimDock from './SimDock.vue'
 //  - scaleTones.js：基础/降调/升调音阶与 assembleScale 装配
 //  - soundEngine.js：SoundEngine 播放引擎（创建即持有，碰撞时调用 engine.play）
 import { SoundEngine, assembleScale } from '../audio/soundEngine.js'
-import { rainbowColors } from '../visual/rainbow.js'
+import { rainbowColors, hsla } from '../visual/rainbow.js'
 
 /* =========================================================
  * 需求映射（音频/配色已抽离为可复用模块，见 src/audio、src/visual）：
@@ -35,7 +35,7 @@ const LINE_WIDTH = 3              // 主直线宽度 px
 const ORIGIN_R = 7                // 原点半径（> 直线宽度）
 const DOT_R = 6                   // 运动点半径
 const LINE_Y_RATIO = 0.58         // 直线在画布高度上的比例位置
-const ARC_ALPHA = 0.3             // 半圆路径不透明度
+const ARC_ALPHA = 0.16            // 半圆路径不透明度（极淡，与 V 形扇摆轨道一致）
 const CONNECT_ALPHA = 0.13        // “点-原点”连线不透明度（须小于 ARC_ALPHA）
 
 // 周期运动规则：最内层点每 CYCLE_PERIOD 秒往返 CYCLE_INNER 次，最外层往返 CYCLE_OUTER 次，
@@ -64,7 +64,7 @@ const sim = {
   cy: 0,
   availR: 0,       // 当前可视区能容纳的最大半径（随窗口 / 悬浮条状态变化）
   scale: 1,        // 整体视图缩放：构图不超界时为 1，超出则等比缩小以完整容纳
-  dots: [],        // 每个运动点: { d, L, pos, dir, bounce }，数组序=距原点由近及远
+  dots: [],        // 每个运动点: { d, L, pos, dir }，数组序=距原点由近及远
   ripples: [],     // 触线反弹时的冲击波纹
 }
 
@@ -147,10 +147,10 @@ function syncDots() {
     if (prev && prev.L > 0) {
       // 尽量保持原来在弧上的相对进度（手动改数量时位置不突兀）
       const frac = Math.min(Math.max(prev.pos / prev.L, 0), 1)
-      return { d, L, pos: frac * L, dir: prev.dir, bounce: -1 }
+      return { d, L, pos: frac * L, dir: prev.dir }
     }
     // 初始静止位置：直线左端 = 弧长尽头（距原点 d）
-    return { d, L, pos: L, dir: -1, bounce: -1 }
+    return { d, L, pos: L, dir: -1 }
   })
 }
 
@@ -168,7 +168,6 @@ function reset() {
   sim.dots.forEach((p) => {
     p.pos = p.L
     p.dir = -1
-    p.bounce = -1
   })
   realElapsed = 0
   virtElapsed = 0
@@ -195,10 +194,8 @@ function flashNotice(text, ms = 2600) {
 
 /* ---------- 运动物理 ---------- */
 function impactAtEnd(p, index) {
-  // 触线反弹：标记冲击时刻（用于绘制弹性压缩/回弹）
-  p.bounce = 0
   const sideX = p.pos <= 0 ? sim.cx + p.d * sim.scale : sim.cx - p.d * sim.scale // 触地点（直线另一端）
-  sim.ripples.push({ x: sideX, y: sim.cy, age: 0 })
+  sim.ripples.push({ x: sideX, y: sim.cy, age: 0, h: dotColors.value[index].hue })
   if (sim.ripples.length > 24) sim.ripples.shift()
   const pan = p.pos <= 0 ? 1 : -1 // 右端点触线 → 右声道(+1)；左端点触线 → 左声道(−1)
   // 对应音符：由音效表按“距原点由近及远”给出（基础 do..si → 降调 → 升调组）
@@ -236,10 +233,6 @@ function update(dt) {
         impactAtEnd(p, i)
       }
       guard++
-    }
-    if (p.bounce >= 0) {
-      p.bounce += dt
-      if (p.bounce > 2) p.bounce = -1 // 弹跳动画结束
     }
   }
   for (let i = sim.ripples.length - 1; i >= 0; i--) {
@@ -306,11 +299,12 @@ function drawCenterGuide(ctx) {
 function drawArcPaths(ctx) {
   ctx.save()
   ctx.lineCap = 'round'
-  for (const p of sim.dots) {
+  for (let i = 0; i < sim.dots.length; i++) {
+    const c = dotColors.value[i]
     ctx.beginPath()
     // canvas 角度 π→2π 即为直线以上的半圆（左端→顶点→右端）；半径按视图缩放
-    ctx.arc(sim.cx, sim.cy, p.d * sim.scale, Math.PI, Math.PI * 2, false)
-    ctx.strokeStyle = `rgba(103,232,249,${ARC_ALPHA})` // 颜色显著淡于主直线
+    ctx.arc(sim.cx, sim.cy, sim.dots[i].d * sim.scale, Math.PI, Math.PI * 2, false)
+    ctx.strokeStyle = hsla(c.hue, 90, 72, ARC_ALPHA) // 与运动点同色，极淡（与 V 形扇摆一致）
     ctx.lineWidth = 2
     ctx.stroke()
   }
@@ -342,7 +336,7 @@ function drawRipples(ctx) {
     const t = Math.min(r.age / 0.7, 1)
     ctx.beginPath()
     ctx.arc(r.x, r.y, 7 + t * 26, 0, Math.PI * 2)
-    ctx.strokeStyle = `rgba(255,255,255,${(1 - t) * 0.55})`
+    ctx.strokeStyle = hsla(r.h ?? 0, 92, 70, (1 - t) * 0.6)
     ctx.lineWidth = 1.5
     ctx.stroke()
   }
@@ -359,15 +353,6 @@ function drawDots(ctx) {
     const x = sim.cx + r * Math.cos(a)
     const y = sim.cy - r * Math.sin(a)
 
-    // 弹性反弹形变：触线瞬间横向压扁(挤压)，随后竖直过冲(回弹)并衰减
-    let rx = DOT_R
-    let ry = DOT_R
-    if (p.bounce >= 0) {
-      const k = Math.exp(-3.4 * p.bounce) * Math.cos(10 * p.bounce)
-      ry = DOT_R * (1 - 0.52 * k)
-      rx = DOT_R * (1 + 0.62 * k)
-    }
-
     // 色晕（用该点自身彩虹色）
     const glow = ctx.createRadialGradient(x, y, 1, x, y, DOT_R * 2.6)
     glow.addColorStop(0, `hsla(${c.hue}, 92%, 66%, 0.45)`)
@@ -379,7 +364,6 @@ function drawDots(ctx) {
 
     ctx.save()
     ctx.translate(x, y)
-    ctx.scale(rx / DOT_R, ry / DOT_R)
 
     // 边缘环
     ctx.beginPath()

@@ -53,7 +53,6 @@ const muted = ref(false)
 const showChord = ref(true)        // 点两两连线
 const showSpoke = ref(true)        // 点-原点连线
 const lastNote = ref(null)
-const activeIdx = ref(-1)
 
 const canvasRef = ref(null)
 const stageRef = ref(null)
@@ -88,14 +87,13 @@ const meta = computed(() =>
 /* ---------- 音频引擎（可复用模块，见 src/audio/soundEngine.js） ---------- */
 const engine = new SoundEngine({ masterVolume: 0.5, debug: AUDIO_DEBUG })
 let noticeTimer = 0
-let highlightTimer = 0
 
 /* ---------- 运行时几何/状态 ---------- */
 const sim = {
   w: 0, h: 0, dpr: 1,
   cx: 0, cy: 0, R: 0, dotR: 5,
   segLen: 0,             // 线段可视长度
-  pts: [],               // { s ∈[-1,1]，相对两线夹角的归一化位置：-1 左线 / +1 右线; dir; bounce }
+  pts: [],               // { s ∈[-1,1]，相对两线夹角的归一化位置：-1 左线 / +1 右线; dir }
   ripples: [],
 }
 
@@ -148,7 +146,7 @@ function syncDots() {
   sim.pts = []
   for (let i = 0; i < n; i++) {
     if (old[i]) sim.pts.push(old[i])   // 复用旧对象：改数量不丢当前相位
-    else sim.pts.push({ s: -1, dir: 1, bounce: -1 })
+    else sim.pts.push({ s: -1, dir: 1 })
   }
 }
 
@@ -163,11 +161,10 @@ function reset() {
   playing.value = false
   engine.unlock()
   sim.ripples.length = 0
-  for (const p of sim.pts) { p.s = -1; p.dir = 1; p.bounce = -1 }
+  for (const p of sim.pts) { p.s = -1; p.dir = 1 }
   realElapsed = 0
   virtElapsed = 0
   lastNote.value = null
-  activeIdx.value = -1
 }
 
 function togglePlay() {
@@ -193,7 +190,6 @@ function flashNotice(text, ms = 2600) {
 // 所以归一化角速度 = 4 · cycles / 60
 function impactAt(i) {
   const p = sim.pts[i]
-  p.bounce = 0
   const d = meta.value[i]
   const r = ((i + 1) / effCount.value) * sim.R
   const th = p.s * halfRad.value // p.s 此时必为 ±1
@@ -205,9 +201,6 @@ function impactAt(i) {
   // 对应音符：由音效表按点序给出（基础 do..si → 降调 → 升调组）
   engine.play(d.freq, pan)
   lastNote.value = { num: d.num, name: d.disp, color: d.color, title: d.title }
-  activeIdx.value = i
-  clearTimeout(highlightTimer)
-  highlightTimer = setTimeout(() => { activeIdx.value = -1 }, 420)
 }
 
 function updateSim(dt) {
@@ -234,10 +227,6 @@ function updateSim(dt) {
         impactAt(i)
       }
       guard++
-    }
-    if (p.bounce >= 0) {
-      p.bounce += dt
-      if (p.bounce > 2) p.bounce = -1
     }
   }
   for (let i = sim.ripples.length - 1; i >= 0; i--) {
@@ -419,16 +408,6 @@ function drawDots(ctx) {
 
     ctx.save()
     ctx.translate(pt.x, pt.y)
-    // 撞线瞬间沿“切向(摆动方向)/径向”的压扁回弹形变
-    let sx = 1
-    let sy = 1
-    if (p.bounce >= 0) {
-      const k = Math.exp(-3.4 * p.bounce) * Math.cos(10 * p.bounce)
-      sy = 1 - 0.5 * k
-      sx = 1 + 0.55 * k
-    }
-    ctx.rotate(pt.th)
-    ctx.scale(sx, sy)
 
     const g = ctx.createRadialGradient(-dotR * 0.35, -dotR * 0.42, dotR * 0.12, 0, 0, dotR * 1.25)
     g.addColorStop(0, '#ffffff')
@@ -444,17 +423,6 @@ function drawDots(ctx) {
     ctx.stroke()
     ctx.restore()
 
-    // 高亮点（图例 hover / 撞线瞬间）显示点序号
-    if (activeIdx.value === i) {
-      ctx.save()
-      ctx.font = '600 11px system-ui, "Microsoft YaHei", sans-serif'
-      ctx.textAlign = 'center'
-      ctx.fillStyle = c.light
-      ctx.shadowColor = c.color
-      ctx.shadowBlur = 6
-      ctx.fillText(String(c.num), pt.x, pt.y - dotR - 8)
-      ctx.restore()
-    }
   }
 }
 
@@ -532,7 +500,6 @@ onBeforeUnmount(() => {
   window.removeEventListener('pointerdown', onUserGesture)
   window.removeEventListener('keydown', onUserGesture)
   clearTimeout(noticeTimer)
-  clearTimeout(highlightTimer)
   engine.dispose()
 })
 
