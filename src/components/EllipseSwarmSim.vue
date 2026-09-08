@@ -840,7 +840,7 @@ if (AUDIO_DEBUG) {
         </button>
       </div>
 
-      <!-- 第二、三行：原底部控制栏（控制项 + 图例） -->
+      <!-- 第二行：原底部控制栏（控制项） -->
       <section v-if="panelOpen" class="dock-body">
         <div class="panel-row controls-row">
           <div class="pgroup grow">
@@ -870,22 +870,6 @@ if (AUDIO_DEBUG) {
           <button class="icon-btn collapse" title="收起底部控制栏" @click="panelOpen = false">
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
           </button>
-        </div>
-
-        <div class="panel-row legend-row">
-          <span class="lg-title">10 层（快→慢）· 同层同色</span>
-          <span
-            v-for="L in LAYERS"
-            :key="L.k"
-            class="lg-chip"
-            :title="`第 ${L.k} 层：${L.count} 个点均匀分布 · 90s 内弹射 ${2 * L.count + 1} 段并回到原点 · 相邻两次碰撞间隔 ${L.hit.toFixed(2)}s · 层内速率比 最快/最慢 = ${(L.rateMax / Math.max(L.rateMin, 1e-6)).toFixed(1)}∶1`"
-          >
-            <i class="lg-dot" :style="{ background: L.color }"></i>
-            <b>{{ L.count }}</b>
-            <em>{{ L.hit.toFixed(2) }}s</em>
-          </span>
-          <span class="rainbow" title="10 层按彩虹色序着色（红→橙→黄→绿→青→蓝→紫）"></span>
-          <span class="lg-note">音效：按经过原点顺序 do re mi fa sol la si，超 7 个升调循环</span>
         </div>
       </section>
 
@@ -1145,12 +1129,6 @@ if (AUDIO_DEBUG) {
   flex-wrap: wrap;
 }
 .panel-row .collapse { margin-left: auto; align-self: flex-start; flex: none; }
-.legend-row {
-  align-items: center;
-  gap: 6px;
-  padding-top: 6px;
-  border-top: 1px dashed rgba(148, 163, 184, 0.16);
-}
 .panel-fab {
   align-self: flex-end;
   margin: 0 0 9px;
@@ -1250,34 +1228,6 @@ output {
   user-select: none;
 }
 .tick input { accent-color: #22d3ee; width: 14px; height: 14px; cursor: pointer; }
-
-/* 图例 */
-.lg-title { font-size: 12px; color: var(--text-3); white-space: nowrap; flex: none; }
-.lg-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 3px 8px;
-  border-radius: 999px;
-  border: 1px solid transparent;
-  background: rgba(15, 23, 42, 0.4);
-  font-size: 11px;
-  color: var(--text-2);
-  cursor: default;
-  white-space: nowrap;
-}
-.lg-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
-.lg-chip b { font-weight: 600; color: var(--text-1); }
-.lg-chip em { font-style: normal; color: var(--text-2); }
-.rainbow {
-  width: 90px;
-  height: 8px;
-  border-radius: 999px;
-  flex: none;
-  background: linear-gradient(90deg, #f43f5e, #fb923c, #facc15, #4ade80, #22d3ee, #818cf8, #e879f9);
-  opacity: 0.85;
-}
-.lg-note { font-size: 11px; color: var(--text-3); white-space: nowrap; }
 
 @media (max-width: 1440px) { .dock-head .note-chip { display: none; } }
 @media (max-width: 1320px) { .dock-head .pass-chip { display: none; } }

@@ -59,7 +59,6 @@ const panelOpen = ref(true)
 const showChord = ref(true)        // 是否绘制点间连线
 const showSpoke = ref(true)        // 是否绘制点-原点连线
 const lastNote = ref(null)         // 最近一次经过原点奏响的音符
-const activeIdx = ref(-1)          // 当前高亮（图例/提示）的点索引
 
 const dirSign = computed(() => (direction.value === 'ccw' ? 1 : -1))
 const directionText = computed(() => (direction.value === 'ccw' ? '逆时针' : '顺时针'))
@@ -80,7 +79,6 @@ let pendingNotes = []          // ctx 未就绪时排队待补发的音符
 let resumePromise = null
 let audioRetryTimer = 0
 let noticeTimer = 0
-let highlightTimer = 0
 let lastResumeProbe = 0
 const audioStats = { builds: 0, unlockCalls: 0, notesScheduled: 0, notesFlushed: 0, noteAttempts: 0, passes: 0 }
 
@@ -149,7 +147,6 @@ function reset() {
   timeReal.value = '00:00.0'
   timeVirt.value = '00:00.0'
   lastNote.value = null
-  activeIdx.value = -1
 }
 
 function togglePlay() {
@@ -364,9 +361,6 @@ function triggerPass(i) {
   sim.ripples.push({ x: ox, y: oy, age: 0, h: DOTS[i].h })
   if (sim.ripples.length > 20) sim.ripples.shift()
   lastNote.value = { num: DOTS[i].num, name: DOTS[i].name, color: DOTS[i].color, title: DOTS[i].title }
-  activeIdx.value = DOTS[i].i
-  clearTimeout(highlightTimer)
-  highlightTimer = setTimeout(() => { activeIdx.value = -1 }, 420)
 }
 
 function updateSim(dt) {
@@ -610,7 +604,6 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', onUserGesture)
   clearTimeout(audioRetryTimer)
   clearTimeout(noticeTimer)
-  clearTimeout(highlightTimer)
   if (audioCtx && audioCtx.state !== 'closed') {
     audioCtx.close().catch(() => {})
     audioCtx = null
@@ -729,7 +722,7 @@ if (AUDIO_DEBUG) {
         </button>
       </div>
 
-      <!-- 第二、三行：原底部控制栏（控制项 + 图例） -->
+      <!-- 第二行：原底部控制栏（控制项） -->
       <section v-if="panelOpen" class="dock-body">
         <div class="panel-row controls-row">
           <div class="pgroup">
@@ -783,21 +776,6 @@ if (AUDIO_DEBUG) {
           <button class="icon-btn collapse" title="收起底部控制栏" @click="panelOpen = false">
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
           </button>
-        </div>
-
-        <div class="panel-row legend-row">
-          <span class="lg-title">音高分配（回到原点奏响）</span>
-          <span
-            v-for="d in DOTS"
-            :key="d.num"
-            class="lg-chip"
-            :class="{ on: activeIdx === d.i }"
-            :title="`第 ${d.num} 点：60s 运行 ${d.num} 圈 · 音符 ${d.title}`"
-          >
-            <i class="lg-dot" :style="{ background: d.color }"></i>
-            <b>{{ d.num }}</b>
-            <em>{{ d.name }}</em>
-          </span>
         </div>
       </section>
 
@@ -1103,12 +1081,6 @@ if (AUDIO_DEBUG) {
   flex-wrap: wrap;
 }
 .panel-row .collapse { margin-left: auto; align-self: flex-start; flex: none; }
-.legend-row {
-  align-items: center;
-  gap: 6px;
-  padding-top: 6px;
-  border-top: 1px dashed rgba(148, 163, 184, 0.16);
-}
 .panel-fab {
   align-self: flex-end;
   margin: 0 0 9px;
@@ -1218,42 +1190,6 @@ output {
   height: 14px;
   cursor: pointer;
 }
-
-/* 音高图例 */
-.lg-title {
-  font-size: 12px;
-  color: var(--text-3);
-  white-space: nowrap;
-}
-.lg-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 3px 8px;
-  border-radius: 999px;
-  border: 1px solid transparent;
-  background: rgba(15, 23, 42, 0.4);
-  font-size: 11px;
-  color: var(--text-2);
-  cursor: default;
-  white-space: nowrap;
-  transition: all 0.18s;
-}
-.lg-dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  flex: none;
-}
-.lg-chip b { font-weight: 600; color: var(--text-1); }
-.lg-chip em { font-style: normal; color: var(--text-2); }
-.lg-chip.on {
-  transform: scale(1.12);
-  border-color: rgba(255, 255, 255, 0.55);
-  box-shadow: 0 0 10px rgba(125, 211, 252, 0.35);
-  background: rgba(56, 189, 248, 0.16);
-}
-.lg-chip.on em { color: #fff; }
 
 @media (max-width: 1440px) {
   .dock-head .note-chip { display: none; }

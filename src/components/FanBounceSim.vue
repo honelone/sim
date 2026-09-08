@@ -1004,7 +1004,7 @@ if (AUDIO_DEBUG) {
         </button>
       </div>
 
-        <!-- 第二、三行：原底部控制栏（控制项 + 图例） -->
+        <!-- 第二行：原底部控制栏（控制项） -->
         <section v-if="panelOpen" class="dock-body">
         <div class="panel-row controls-row">
           <div class="pgroup">
@@ -1067,23 +1067,6 @@ if (AUDIO_DEBUG) {
           <button class="icon-btn collapse" title="收起底部控制栏" @click="panelOpen = false">
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
           </button>
-        </div>
-
-        <div class="panel-row legend-row">
-          <span class="lg-title">点序 → 颜色（彩虹循环）与撞线音高（每 7 点升一调）</span>
-          <span
-            v-for="d in meta"
-            :key="d.num"
-            class="lg-chip"
-            :class="{ on: activeIdx === d.i }"
-            :title="d.title"
-            @mouseenter="activeIdx = d.i"
-            @mouseleave="activeIdx = -1"
-          >
-            <i class="lg-dot" :style="{ background: d.color }"></i>
-            <b>{{ d.num }}</b>
-            <em>{{ d.disp }}</em>
-          </span>
         </div>
       </section>
 
@@ -1439,16 +1422,6 @@ if (AUDIO_DEBUG) {
   flex-wrap: wrap;
 }
 .panel-row .collapse { margin-left: auto; align-self: flex-start; flex: none; }
-.legend-row {
-  align-items: center;
-  gap: 6px;
-  padding-top: 6px;
-  border-top: 1px dashed rgba(148, 163, 184, 0.16);
-  max-height: 104px;
-  overflow-y: auto;
-  scrollbar-width: none;
-}
-.legend-row::-webkit-scrollbar { display: none; }
 .panel-fab {
   align-self: flex-end;
   margin: 0 0 9px;
@@ -1567,43 +1540,6 @@ output {
   height: 14px;
   cursor: pointer;
 }
-
-/* 图例 */
-.lg-title {
-  font-size: 12px;
-  color: var(--text-3);
-  white-space: nowrap;
-  flex: none;
-}
-.lg-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 3px 8px;
-  border-radius: 999px;
-  border: 1px solid transparent;
-  background: rgba(15, 23, 42, 0.4);
-  font-size: 11px;
-  color: var(--text-2);
-  cursor: default;
-  white-space: nowrap;
-  transition: all 0.18s;
-}
-.lg-dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  flex: none;
-}
-.lg-chip b { font-weight: 600; color: var(--text-1); }
-.lg-chip em { font-style: normal; color: var(--text-2); }
-.lg-chip.on {
-  transform: scale(1.1);
-  border-color: rgba(255, 255, 255, 0.55);
-  box-shadow: 0 0 10px rgba(125, 211, 252, 0.35);
-  background: rgba(56, 189, 248, 0.16);
-}
-.lg-chip.on em { color: #fff; }
 
 @media (max-width: 1520px) {
   .dock-head .seek-btn { display: none; }
