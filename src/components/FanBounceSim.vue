@@ -1,5 +1,6 @@
 <script setup>
 import { onMounted, onBeforeUnmount, ref, watch, computed } from 'vue'
+import SimDock from './SimDock.vue'
 
 /* =========================================================
  * 需求映射：
@@ -72,13 +73,9 @@ const showSpoke = ref(true)        // 点-原点连线
 const lastNote = ref(null)
 const activeIdx = ref(-1)
 
-const audioState = ref('idle')
-const audioNotice = ref('')
-const blockedClicks = ref(0)
-
 const canvasRef = ref(null)
 const stageRef = ref(null)
-const dockEl = ref(null)   // 顶部总控条（header + panel 合并后的一体容器）
+const dockRef = ref(null)   // 顶部总控条（SimDock 组件根，供 layout 测量遮挡高度）
 
 // 每个运动点的元信息（颜色 = 彩虹七色按点序循环；音符 = 七音阶按点序循环升调）
 const meta = computed(() =>
@@ -125,7 +122,6 @@ let lastTs = 0
 let resizeObserver = null
 let realElapsed = 0
 let virtElapsed = 0
-const seekText = ref('00:00')
 
 /* ---------- 布局：原点居中，V 形与圆弧整体位于上半区 ---------- */
 function layout() {
@@ -143,8 +139,8 @@ function layout() {
   canvas.width = Math.round(w * dpr)
   canvas.height = Math.round(h * dpr)
 
-  // header 与 panel 已合并为顶部一条总控条：直接测量它实际遮挡的顶部高度（含与顶部的间距）
-  const padT = (dockEl.value ? dockEl.value.getBoundingClientRect().bottom - rect.top : 150) + 16
+  // 顶部总控条已合并为一条：直接测量它实际遮挡的顶部高度（含与顶部的间距）
+  const padT = (dockRef.value && dockRef.value.root ? dockRef.value.root.getBoundingClientRect().bottom - rect.top : 150) + 16
   const padB = 24
   const regionTop = padT
   const regionBottom = Math.max(padT + 120, h - padB)
@@ -178,75 +174,6 @@ function stepCount(delta) {
   setCount((Number(count.value) || 1) + delta)
 }
 
-/* ---------- 时间显示 ---------- */
-function fmtMMSS(s) {
-  const m = Math.floor(s / 60)
-  const sec = Math.floor(s % 60)
-  return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
-}
-function parseSeekSeconds(text) {
-  const txt = String(text || '').trim()
-  if (!txt) return null
-  if (/^\d{1,3}(\.\d+)?$/.test(txt)) return parseFloat(txt)
-  const m = /^(\d{1,2}):([0-5]?\d)(\.\d+)?$/.exec(txt)
-  if (m) return parseInt(m[1], 10) * 60 + parseFloat(m[2] + (m[3] || ''))
-  return null
-}
-
-// 已知等效时间 t，求第 i 个点的归一化位置与方向（供 seek 快照）
-function sampleAt(t, i) {
-  const n = effCount.value
-  const d = meta.value[i]
-  const P = d.period
-  let u = t % P
-  if (u < 0) u += P
-  if (u <= d.half) return { s: -1 + 2 * (u / d.half), dir: 1 }
-  return { s: 1 - 2 * ((u - d.half) / d.half), dir: -1 }
-}
-
-function seekEq(secsRaw, quiet = false) {
-  const secs = Number(secsRaw)
-  if (!Number.isFinite(secs)) {
-    if (!quiet) flashNotice('请输入有效时间，如 00:30 或 30（秒）', 2600)
-    return
-  }
-  const clamped = Math.min(Math.max(secs, 0), CYCLE_SECONDS)
-  if (!quiet && clamped !== secs) {
-    flashNotice(`定位时间需在 0:00 ~ 1:00 之间，已调整为 ${fmtMMSS(clamped)}`, 3000)
-  }
-  const n = effCount.value
-  for (let i = 0; i < n; i++) {
-    const s = sampleAt(clamped, i)
-    const p = sim.pts[i]
-    p.s = s.s
-    p.dir = s.dir
-    p.bounce = -1
-  }
-  sim.ripples.length = 0
-  const scale = Number(speedScale.value) || 1
-  virtElapsed = clamped
-  realElapsed = clamped / scale
-  seekText.value = fmtMMSS(clamped)
-  render()
-}
-function applySeekInput() {
-  const secs = parseSeekSeconds(seekText.value)
-  if (secs === null) {
-    seekText.value = fmtMMSS(Math.round(virtElapsed))
-    flashNotice('格式示例：00:20、1:00 或 30（秒）', 2800)
-    return
-  }
-  seekEq(secs)
-  flashNotice(`已定位到 ${fmtMMSS(Math.min(Math.max(secs, 0), CYCLE_SECONDS))} 的瞬时位置`, 1600)
-}
-function seekLive() {
-  const secs = parseSeekSeconds(seekText.value)
-  if (secs !== null && secs >= 0 && secs <= CYCLE_SECONDS) seekEq(secs, true)
-}
-function nudgeSeek(delta) {
-  seekEq(virtElapsed + delta, true)
-}
-
 function reset() {
   playing.value = false
   unlockAudio()
@@ -254,7 +181,6 @@ function reset() {
   for (const p of sim.pts) { p.s = -1; p.dir = 1; p.bounce = -1 }
   realElapsed = 0
   virtElapsed = 0
-  seekText.value = '00:00'
   lastNote.value = null
   activeIdx.value = -1
 }
@@ -276,7 +202,7 @@ function buildAudioGraph() {
   if (audioCtx && audioCtx.state !== 'closed') return true
   if (audioCtx) { audioCtx = null; masterGain = null; noiseBuffer = null }
   const AC = window.AudioContext || window['webkitAudioContext']
-  if (!AC) { audioState.value = 'unsupported'; return false }
+  if (!AC) { return false }
   try {
     audioCtx = new AC()
     audioCtx.addEventListener('statechange', onAudioStateChange)
@@ -302,7 +228,6 @@ function buildAudioGraph() {
     audioCtx = null
     masterGain = null
     noiseBuffer = null
-    audioState.value = 'blocked'
     return false
   }
   return true
@@ -311,8 +236,6 @@ function buildAudioGraph() {
 function onAudioStateChange() {
   if (!audioCtx) return
   if (audioCtx.state === 'running') {
-    audioState.value = 'ready'
-    blockedClicks.value = 0
     flushPending()
     if (audioRetryTimer) { clearTimeout(audioRetryTimer); audioRetryTimer = 0 }
   }
@@ -321,14 +244,12 @@ function onAudioStateChange() {
 function unlockAudio() {
   if (!buildAudioGraph()) return Promise.resolve(false)
   audioStats.unlockCalls++
-  if (audioCtx.state === 'running') { audioState.value = 'ready'; return Promise.resolve(true) }
+  if (audioCtx.state === 'running') { return Promise.resolve(true) }
   if (audioCtx.state === 'suspended' && !resumePromise) {
-    audioState.value = 'starting'
     resumePromise = audioCtx.resume().then(
       () => { resumePromise = null; return !!(audioCtx && audioCtx.state === 'running') },
       () => {
         resumePromise = null
-        audioState.value = 'blocked'
         scheduleRetry()
         return false
       }
@@ -344,9 +265,9 @@ function scheduleRetry() {
   }, 900)
 }
 function flashNotice(text, ms = 2600) {
-  audioNotice.value = text
-  clearTimeout(noticeTimer)
-  noticeTimer = setTimeout(() => (audioNotice.value = ''), ms)
+  if (noticeTimer) clearTimeout(noticeTimer)
+  noticeTimer = setTimeout(() => { noticeTimer = 0 }, ms)
+  void text
 }
 function flushPending() {
   if (!pendingNotes.length || !audioCtx || audioCtx.state !== 'running') return
@@ -419,7 +340,7 @@ function noiseHit(t0, dur, pan) {
     if (out !== masterGain) out.disconnect()
   }
 }
-// index 0 起；pan：-1 左线碰撞(左声道) / 0 居中(试听) / +1 右线碰撞(右声道)
+// index 0 起；pan：-1 左线碰撞(左声道) / 0 居中 / +1 右线碰撞(右声道)
 function scheduleNoteNow(index, pan = 0) {
   if (muted.value || !audioCtx || !masterGain || audioCtx.state !== 'running') return false
   const t0 = audioCtx.currentTime
@@ -449,23 +370,6 @@ function playCollisionNote(index, pan = 0) {
   }
 }
 
-async function testSound() {
-  if (muted.value) { flashNotice('已静音：请先点击“音效开/静音”开启声音', 2400); return }
-  const ok = await unlockAudio()
-  if (audioState.value === 'unsupported') { flashNotice('当前浏览器不支持 Web Audio，无法发声', 3800); return }
-  if (!ok || (audioCtx && audioCtx.state !== 'running')) {
-    blockedClicks.value++
-    if (blockedClicks.value >= 2) {
-      flashNotice('浏览器一直拦截本站声音：请点地址栏左侧图标→将本站设为“允许声音”，或在新标签页打开本页后重试', 5200)
-    } else {
-      flashNotice('音频被浏览器拦截：本次点击即是解锁动作，请再点一次“试听”', 3600)
-    }
-    return
-  }
-  blockedClicks.value = 0
-  const played = scheduleNoteNow(0)
-  flashNotice(played ? '已播放 do 试听音；若仍听不到：检查系统音量/耳机、标签页是否被静音' : '试听调度失败：请检查系统音量与输出设备', 4600)
-}
 function audioSupervisor() {
   if (!audioCtx) return
   if (audioCtx.state === 'closed') { buildAudioGraph(); return }
@@ -474,31 +378,6 @@ function audioSupervisor() {
     if (now - lastResumeProbe > 1000) { lastResumeProbe = now; unlockAudio() }
   }
 }
-
-const audioChipText = computed(() => {
-  if (audioNotice.value) return audioNotice.value
-  switch (audioState.value) {
-    case 'idle': return '音频：待启动'
-    case 'starting': return '音频：解锁中…'
-    case 'ready': return muted.value ? '音频：就绪 · 已静音' : '音频：就绪'
-    case 'blocked': return '⚠ 音频被浏览器拦截'
-    case 'unsupported': return '⚠ 不支持 Web Audio'
-    default: return '音频：未知状态'
-  }
-})
-const audioChipCls = computed(() => {
-  if (audioNotice.value) return 'notice'
-  return audioState.value === 'ready' ? (muted.value ? 'ok muted' : 'ok') : 'warn'
-})
-const audioChipTitle = computed(() => {
-  if (audioState.value === 'blocked') {
-    return '浏览器自动播放策略拦截了本站音频。请连续点击“试听”1~2 次（点击本身即解锁动作）；若仍失败，请点击地址栏左侧图标将本站设为“允许声音”'
-  }
-  if (audioState.value === 'ready') {
-    return '音频已就绪：Web Audio 实时合成（无外部文件）。若听不到声音请检查系统音量/输出设备/标签页是否被静音'
-  }
-  return '撞线音效由 Web Audio 实时合成；首次使用请点击“试听”或“播放”解锁'
-})
 
 /* ---------- 运动物理：归一化角位置 s∈[-1,1]，±1 对应左右线段 ---------- */
 // 一个往返周期走满 4（-1→+1→-1）；第 i 点在 60s 内往返 cyclesOf(i) 次，
@@ -872,144 +751,22 @@ if (AUDIO_DEBUG) {
       <canvas ref="canvasRef" class="sim-canvas"></canvas>
     </div>
 
-      <!-- ============ 顶部总控条：状态/操作 + 控制 合并为一条悬浮卡片 ============ -->
-      <div class="dock" ref="dockEl">
-        <!-- 第一行：状态与操作（已移除标题与计时显示） -->
-        <header class="dock-head">
-        <div class="header-actions">
-          <span
-            class="note-chip"
-            :class="{ lit: lastNote }"
-            title="最近一次运动点撞线时奏响的音符"
-          >
-            <i class="note-dot" :style="lastNote ? { background: lastNote.color } : null"></i>
-            <template v-if="lastNote">点{{ lastNote.num }} · {{ lastNote.name }}</template>
-            <template v-else>—</template>
-          </span>
-          <span class="seek-chip">
-            <b class="seek-label">定位</b>
-            <input
-              class="seek-input"
-              v-model="seekText"
-              inputmode="decimal"
-              spellcheck="false"
-              placeholder="mm:ss"
-              title="输入 mm:ss（如 00:30）或纯秒数（如 30），回车跳转；范围 0:00 ~ 1:00"
-              @input="seekLive"
-              @keydown.enter.prevent="applySeekInput"
-              @keydown.esc="seekText = fmtMMSS(Math.round(virtElapsed))"
-            />
-            <button class="seek-btn" title="后退 10 秒" @click="nudgeSeek(-10)">−10s</button>
-            <button class="seek-btn" title="前进 10 秒" @click="nudgeSeek(10)">+10s</button>
-            <button class="seek-btn go" title="跳转到输入的时间点" @click="applySeekInput">跳转</button>
-          </span>
-          <span class="audio-state" :class="audioChipCls" :title="audioChipTitle">
-            <i></i>{{ audioChipText }}
-          </span>
-          <button class="btn ghost sound" :class="{ muted }" @click="toggleMute" :title="muted ? '开启撞线音效' : '关闭撞线音效'">
-            <svg v-if="muted" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M11 5 6 9H2v6h4l5 4V5z" />
-              <line x1="23" y1="9" x2="17" y2="15" />
-              <line x1="17" y1="9" x2="23" y2="15" />
-            </svg>
-            <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M11 5 6 9H2v6h4l5 4V5z" />
-              <path d="M15.5 8.5a5 5 0 0 1 0 7" />
-              <path d="M18.5 5.5a9 9 0 0 1 0 13" />
-            </svg>
-            {{ muted ? '已静音' : '音效开' }}
-          </button>
-          <button class="btn ghost" @click="testSound" title="立即播放一个 do，用于验证声音并解锁浏览器限制">
-            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M9 18V5l12-2v13" />
-              <circle cx="6" cy="18" r="3" />
-              <circle cx="18" cy="16" r="3" />
-            </svg>
-            试听
-          </button>
-          <button class="btn ghost" @click="reset" title="重置到左侧线段 (R)">
-            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M3 12a9 9 0 1 0 3-6.7" />
-              <path d="M3 4v5h5" />
-            </svg>
-            重置
-          </button>
-          <button class="btn play" :class="{ paused: !playing }" @click="togglePlay" title="播放/暂停 (空格)">
-            <svg v-if="playing" viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
-              <rect x="6" y="5" width="4" height="14" rx="1" />
-              <rect x="14" y="5" width="4" height="14" rx="1" />
-            </svg>
-            <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
-              <path d="M8 5.5v13a1 1 0 0 0 1.5.9l11-6.5a1 1 0 0 0 0-1.8l-11-6.5A1 1 0 0 0 8 5.5Z" />
-            </svg>
-            {{ playing ? '暂停' : '播放' }}
-          </button>
-        </div>
-      </header>
-
-        <!-- 第二行：原底部控制栏（控制项） -->
-        <section class="dock-body">
-        <div class="panel-row controls-row">
-          <div class="pgroup">
-            <span class="plabel">点的数量</span>
-            <div class="stepper">
-              <button class="step" :disabled="effCount <= MIN_COUNT" @click="stepCount(-1)">−</button>
-              <input
-                class="num"
-                type="number"
-                :min="MIN_COUNT"
-                :max="MAX_COUNT"
-                v-model.number="count"
-                @change="setCount(count)"
-              />
-              <button class="step" :disabled="effCount >= MAX_COUNT" @click="stepCount(1)">+</button>
-            </div>
-            <small>默认 30：第 n 点 60s 内往返 {{ effCount }} 递减至 1 次（内快外慢）</small>
-          </div>
-
-          <div class="pgroup">
-            <span class="plabel">两线夹角</span>
-            <div class="range-row">
-              <input
-                class="range"
-                type="range"
-                :min="WEDGE_MIN"
-                :max="WEDGE_MAX"
-                step="1"
-                v-model.number="wedgeDeg"
-                title="两条线段在原点处形成的夹角；默认 135°（单侧相对竖直倾斜 67.5°）。注：需求中“倾斜 62.5°×2=125°”与“夹角 135°”不一致，故默认以 135° 夹角为准，可在此调节"
-              />
-              <output>{{ wedgeDeg }}°</output>
-            </div>
-            <small>单侧相对竖直 {{ (wedgeDeg / 2).toFixed(1) }}°</small>
-          </div>
-
-          <div class="pgroup grow">
-            <span class="plabel">演示倍速</span>
-            <div class="range-row">
-              <input
-                class="range"
-                type="range"
-                min="0.25"
-                max="10"
-                step="0.25"
-                v-model.number="speedScale"
-                title="等比缩放所有点的摆动速度，不改变“内快外慢”的比例"
-              />
-              <output>×{{ speedScale }}</output>
-            </div>
-            <small>60s 内最内层往返 30 次 → 最外层 1 次（按层递减）</small>
-          </div>
-
-          <div class="pgroup">
-            <span class="plabel">连线显示</span>
-            <label class="tick"><input type="checkbox" v-model="showChord" />各点之间连线</label>
-            <label class="tick"><input type="checkbox" v-model="showSpoke" />各点─原点连线</label>
-            <small>连线均比线段路径更淡</small>
-          </div>
-        </div>
-      </section>
-    </div>
+    <SimDock
+      ref="dockRef"
+      :playing="playing"
+      :muted="muted"
+      :show-count="true"
+      :count="count"
+      :count-min="MIN_COUNT"
+      :count-max="MAX_COUNT"
+      :speed="speedScale"
+      @toggle-play="togglePlay"
+      @toggle-mute="toggleMute"
+      @reset="reset"
+      @update:count="setCount"
+      @step-count="stepCount"
+      @update:speed="(v) => (speedScale = v)"
+    />
   </div>
 </template>
 
@@ -1032,16 +789,13 @@ if (AUDIO_DEBUG) {
   height: 100%;
 }
 
-/* ---------- 顶部总控条：header + panel 合并成一条悬浮玻璃卡片 ---------- */
+/* ---------- 顶部总控条：合并后的整体悬浮玻璃卡片 ---------- */
 .dock {
   position: absolute;
   top: 40px;                     /* 让开顶部居中的页面切换器 */
   left: clamp(8px, 1.6vw, 20px);
   right: clamp(8px, 1.6vw, 20px);
   z-index: 6;
-  display: flex;
-  flex-direction: column;
-  padding: 0 clamp(12px, 2vw, 24px);
   border: 1px solid var(--border);
   border-radius: 16px;
   background: linear-gradient(180deg, rgba(8, 13, 26, 0.92), rgba(15, 23, 42, 0.74));
@@ -1049,134 +803,31 @@ if (AUDIO_DEBUG) {
   box-shadow: 0 14px 40px rgba(2, 6, 23, 0.5);
 }
 
-/* 第一行：状态与操作（无标题，整体居中排列） */
-.dock-head {
+/* 合并后的整体控制条：操作按钮 + 参数控件 一行流式排列 */
+.dock-inner {
   display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 14px;
   flex-wrap: wrap;
-  min-height: 44px;
-  padding: 8px 0;
+  flex-direction: row-reverse;
+  align-items: center;
+  gap: clamp(10px, 2vw, 22px);
+  padding: 10px clamp(12px, 2vw, 20px);
 }
-.header-actions {
-  display: flex;
-  gap: 10px;
+.actions {
+  display: inline-flex;
   align-items: center;
+  gap: 8px;
+  flex: none;
+}
+.controls {
+  display: flex;
   flex-wrap: wrap;
-  justify-content: center;
+  align-items: center;
+  gap: clamp(14px, 2.4vw, 36px);
+  flex: 1 1 auto;
   min-width: 0;
 }
-.note-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  padding: 5px 10px;
-  border-radius: 999px;
-  border: 1px solid rgba(148, 163, 184, 0.2);
-  background: rgba(15, 23, 42, 0.55);
-  color: var(--text-2);
-  white-space: nowrap;
-  transition: border-color 0.2s, box-shadow 0.2s;
-}
-.note-chip.lit {
-  border-color: rgba(56, 189, 248, 0.5);
-  box-shadow: 0 0 10px rgba(56, 189, 248, 0.18);
-  color: #e2e8f0;
-}
-.note-dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  flex: none;
-  background: var(--text-3);
-  box-shadow: 0 0 6px currentColor;
-}
-.seek-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 12px;
-  padding: 4px 8px;
-  border-radius: 999px;
-  border: 1px solid rgba(56, 189, 248, 0.28);
-  background: rgba(15, 23, 42, 0.55);
-  color: var(--text-2);
-  white-space: nowrap;
-}
-.seek-label {
-  color: var(--text-3);
-  font-weight: 500;
-  margin-right: 2px;
-}
-.seek-input {
-  width: 56px;
-  padding: 3px 6px;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: rgba(2, 6, 23, 0.72);
-  color: var(--text-1);
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-  outline: none;
-}
-.seek-input:focus {
-  border-color: #38bdf8;
-  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.18);
-}
-.seek-input::placeholder {
-  color: var(--text-3);
-  opacity: 0.6;
-}
-.seek-btn {
-  padding: 3px 7px;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: rgba(30, 41, 59, 0.6);
-  color: var(--text-2);
-  font-size: 11px;
-  cursor: pointer;
-  line-height: 1.4;
-}
-.seek-btn:hover {
-  border-color: #38bdf8;
-  color: var(--text-1);
-  background: rgba(56, 189, 248, 0.12);
-}
-.seek-btn.go {
-  border-color: rgba(56, 189, 248, 0.45);
-  color: #7dd3fc;
-}
-.audio-state {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  padding: 5px 10px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: rgba(15, 23, 42, 0.55);
-  color: var(--text-2);
-  max-width: 230px;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.audio-state i {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--text-3);
-  flex: none;
-}
-.audio-state.ok { border-color: rgba(74, 222, 128, 0.35); }
-.audio-state.ok i { background: #4ade80; box-shadow: 0 0 6px rgba(74, 222, 128, 0.8); }
-.audio-state.ok.muted i { background: #fbbf24; box-shadow: none; }
-.audio-state.warn { border-color: rgba(251, 191, 36, 0.4); color: #fcd34d; }
-.audio-state.warn i { background: #fbbf24; }
-.audio-state.notice { border-color: rgba(56, 189, 248, 0.4); color: #7dd3fc; }
-.audio-state.notice i { background: #38bdf8; }
+
+
 
 .btn {
   display: inline-flex;
@@ -1198,7 +849,6 @@ if (AUDIO_DEBUG) {
   border-color: rgba(148, 163, 184, 0.4);
 }
 .btn:active { transform: scale(0.96); }
-.btn.ghost svg { color: var(--text-2); }
 .btn.sound.muted { opacity: 0.75; border-color: rgba(248, 113, 113, 0.45); }
 .btn.sound.muted svg { color: #f87171; }
 .btn.play {
@@ -1212,42 +862,8 @@ if (AUDIO_DEBUG) {
 }
 .btn.play:hover { filter: brightness(1.08); }
 
-.icon-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 30px;
-  height: 30px;
-  border-radius: 9px;
-  flex: none;
-  border: 1px solid var(--border);
-  background: rgba(30, 41, 59, 0.6);
-  color: var(--text-2);
-  cursor: pointer;
-  transition: all 0.15s;
-}
-.icon-btn:hover {
-  color: #e2e8f0;
-  border-color: #38bdf8;
-  background: rgba(56, 189, 248, 0.12);
-}
-
-/* 第二行：原底部控制栏内容，与第一行上下堆叠 */
-.dock-body {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 8px 0 10px;
-  border-top: 1px dashed rgba(148, 163, 184, 0.2);
-}
-.panel-row {
-  display: flex;
-  align-items: flex-end;
-  gap: clamp(16px, 3vw, 36px);
-  flex-wrap: wrap;
-}
 .pgroup { min-width: 150px; display: flex; flex-direction: column; gap: 6px; }
-.pgroup.grow { flex: 1; min-width: 220px; max-width: 440px; }
+.pgroup.grow { flex: 1; min-width: 200px; max-width: 440px; }
 .plabel {
   font-size: 12px;
   color: var(--text-2);
@@ -1346,19 +962,42 @@ output {
   cursor: pointer;
 }
 
-@media (max-width: 1520px) {
-  .dock-head .seek-btn { display: none; }
+/* 倍速下拉 */
+.speed-select {
+  appearance: none;
+  -webkit-appearance: none;
+  height: 34px;
+  width: 76px;
+  padding: 0 26px 0 10px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background-color: rgba(2, 6, 23, 0.7);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  color: var(--text-1);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  outline: none;
+  transition: border 0.15s, box-shadow 0.15s;
 }
-@media (max-width: 1380px) {
-  .dock-head .seek-chip { display: none; }
+.speed-select:focus {
+  border-color: #38bdf8;
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.18);
 }
-@media (max-width: 1440px) {
-  .dock-head .note-chip { display: none; }
+.pgroup.inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
 }
-@media (max-width: 1280px) {
-  .dock-head .audio-state { display: none; }
+.pgroup.inline .plabel {
+  white-space: nowrap;
 }
-@media (max-width: 1180px) {
-  .dock-head .btn.sound { display: none; }
+.pgroup.inline small {
+  display: none;
 }
+
+@media (max-width: 1080px) { .btn.sound { display: none; } }
 </style>

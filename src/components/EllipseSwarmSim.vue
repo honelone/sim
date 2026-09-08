@@ -1,5 +1,6 @@
 <script setup>
 import { onMounted, onBeforeUnmount, ref, computed } from 'vue'
+import SimDock from './SimDock.vue'
 
 /* =========================================================
  * 需求映射：
@@ -26,7 +27,7 @@ const LAYER_RING_ALPHA = 0.2  // 各层当前椭圆（< RING_ALPHA，> 连线）
 const LAYER_CHORD_ALPHA = 0.22   // 同层内相邻点连线（比圆形路径更淡，但清晰可见）
 const ORIGIN_R = 7            // 原点半径
 const MIN_NOTE_GAP = 0.11     // 相邻发声最小真实间隔（层回归约 1.6 次/秒）
-const DEFAULT_SPEED = 0.5     // 默认倍速（整体放慢，便于观察一层层的发散）
+const DEFAULT_SPEED = 1       // 默认倍速（下拉选项 1x/2x/5x/10x）
 const AUDIO_DEBUG = true      // 调试开关：true 时暴露 window.__ellipseAudio
 
 /* 层 k 的周期数 = 该层点数：19 点层 90s 跑 19 个来回，10 点层跑 10 个。
@@ -146,13 +147,9 @@ const showEnv = ref(true)           // 是否绘制各层包络圆
 const lastNote = ref(null)
 const activeIdx = ref(-1)
 
-const audioState = ref('idle')
-const audioNotice = ref('')
-const blockedClicks = ref(0)
-
 const canvasRef = ref(null)
 const stageRef = ref(null)
-const dockEl = ref(null)   // 顶部总控条（header + panel 合并后的一体容器）
+const dockRef = ref(null)   // 顶部总控条（SimDock 组件根，供 layout 测量遮挡高度）
 
 /* ---------- 运行时非响应式数据 ---------- */
 const sim = {
@@ -188,8 +185,8 @@ function layout() {
   canvas.width = Math.round(w * dpr)
   canvas.height = Math.round(h * dpr)
 
-  // header 与 panel 已合并为顶部一条总控条：直接测量它实际遮挡的顶部高度（含与顶部的间距）
-  const padT = (dockEl.value ? dockEl.value.getBoundingClientRect().bottom - rect.top : 150) + 18
+  // 顶部总控条已合并为一条：直接测量它实际遮挡的顶部高度（含与顶部的间距）
+  const padT = (dockRef.value && dockRef.value.root ? dockRef.value.root.getBoundingClientRect().bottom - rect.top : 150) + 18
   const padB = 24
   const regionTop = padT
   const regionBottom = Math.max(padT + 120, h - padB)
@@ -247,7 +244,7 @@ function buildAudioGraph() {
   if (audioCtx && audioCtx.state !== 'closed') return true
   if (audioCtx) { audioCtx = null; masterGain = null }
   const AC = window.AudioContext || window['webkitAudioContext']
-  if (!AC) { audioState.value = 'unsupported'; return false }
+  if (!AC) { return false }
   try {
     audioCtx = new AC()
     audioCtx.addEventListener('statechange', onAudioStateChange)
@@ -267,7 +264,6 @@ function buildAudioGraph() {
     try { audioCtx && audioCtx.close() } catch (e) {}
     audioCtx = null
     masterGain = null
-    audioState.value = 'blocked'
     return false
   }
   return true
@@ -276,8 +272,6 @@ function buildAudioGraph() {
 function onAudioStateChange() {
   if (!audioCtx) return
   if (audioCtx.state === 'running') {
-    audioState.value = 'ready'
-    blockedClicks.value = 0
     flushPending()
     if (audioRetryTimer) { clearTimeout(audioRetryTimer); audioRetryTimer = 0 }
   }
@@ -286,12 +280,11 @@ function onAudioStateChange() {
 function unlockAudio() {
   if (!buildAudioGraph()) return Promise.resolve(false)
   audioStats.unlockCalls++
-  if (audioCtx.state === 'running') { audioState.value = 'ready'; return Promise.resolve(true) }
+  if (audioCtx.state === 'running') { return Promise.resolve(true) }
   if (audioCtx.state === 'suspended' && !resumePromise) {
-    audioState.value = 'starting'
     resumePromise = audioCtx.resume().then(
       () => { resumePromise = null; return !!(audioCtx && audioCtx.state === 'running') },
-      () => { resumePromise = null; audioState.value = 'blocked'; scheduleRetry(); return false }
+      () => { resumePromise = null; scheduleRetry(); return false }
     )
   }
   return resumePromise || Promise.resolve(false)
@@ -306,9 +299,9 @@ function scheduleRetry() {
 }
 
 function flashNotice(text, ms = 2600) {
-  audioNotice.value = text
-  clearTimeout(noticeTimer)
-  noticeTimer = setTimeout(() => (audioNotice.value = ''), ms)
+  if (noticeTimer) clearTimeout(noticeTimer)
+  noticeTimer = setTimeout(() => { noticeTimer = 0 }, ms)
+  void text
 }
 
 function flushPending() {
@@ -370,24 +363,6 @@ function playLayerNote(layer) {
   }
 }
 
-async function testSound() {
-  if (muted.value) { flashNotice('已静音：请先点击“音效开/静音”开启声音', 2400); return }
-  const ok = await unlockAudio()
-  if (audioState.value === 'unsupported') { flashNotice('当前浏览器不支持 Web Audio，无法发声', 3800); return }
-  if (!ok || (audioCtx && audioCtx.state !== 'running')) {
-    blockedClicks.value++
-    if (blockedClicks.value >= 2) {
-      flashNotice('浏览器一直拦截本站声音：请点地址栏左侧图标→将本站设为“允许声音”，或在新标签页打开本页后重试', 5200)
-    } else {
-      flashNotice('音频被浏览器拦截：本次点击即是解锁动作，请再点一次“试听”', 3600)
-    }
-    return
-  }
-  blockedClicks.value = 0
-  const played = scheduleNoteNow(noteSeq)
-  flashNotice(played ? '已播放试听音；若仍听不到：检查系统音量/耳机、标签页是否被静音' : '试听调度失败：请检查系统音量与输出设备', 4600)
-}
-
 function audioSupervisor() {
   if (!audioCtx) return
   if (audioCtx.state === 'closed') { buildAudioGraph(); return }
@@ -396,31 +371,6 @@ function audioSupervisor() {
     if (now - lastResumeProbe > 1000) { lastResumeProbe = now; unlockAudio() }
   }
 }
-
-const audioChipText = computed(() => {
-  if (audioNotice.value) return audioNotice.value
-  switch (audioState.value) {
-    case 'idle': return '音频：待启动'
-    case 'starting': return '音频：解锁中…'
-    case 'ready': return muted.value ? '音频：就绪 · 已静音' : '音频：就绪'
-    case 'blocked': return '⚠ 音频被浏览器拦截'
-    case 'unsupported': return '⚠ 不支持 Web Audio'
-    default: return '音频：未知状态'
-  }
-})
-const audioChipCls = computed(() => {
-  if (audioNotice.value) return 'notice'
-  return audioState.value === 'ready' ? (muted.value ? 'ok muted' : 'ok') : 'warn'
-})
-const audioChipTitle = computed(() => {
-  if (audioState.value === 'blocked') {
-    return '浏览器自动播放策略拦截了本站音频。请连续点击“试听”1~2 次（点击本身即解锁动作）；若仍失败，请点击地址栏左侧图标将本站设为“允许声音”'
-  }
-  if (audioState.value === 'ready') {
-    return '音频已就绪：Web Audio 实时合成（无外部文件）。与圆形轨道碰撞时发声，每层一种固定音、由外到内 do re mi… 依次递增；回归原点不发声'
-  }
-  return '撞轨道音效由 Web Audio 实时合成；首次使用请点击“试听”或“播放”解锁'
-})
 
 /* ---------- 运动：圆形台球（直线飞行 + 入射角 = 反射角） ----------
  * 第 n 个碰撞点的圆心角：φ(n) = -π/2 + n·Δ，Δ = 2π·q/p
@@ -713,94 +663,17 @@ if (AUDIO_DEBUG) {
       <canvas ref="canvasRef" class="sim-canvas"></canvas>
     </div>
 
-    <!-- ================= 顶部总控条：状态/操作 + 控制 合并为一条悬浮卡片 ================= -->
-    <div class="dock" ref="dockEl">
-      <!-- 第一行：状态与操作（已移除标题、计时与计数显示） -->
-      <header class="dock-head">
-        <div class="header-actions">
-          <span
-            class="note-chip"
-            :class="{ lit: lastNote }"
-            title="最近一次运动点经过原点时奏响的音符（按经过顺序 do re mi fa sol la si 升调循环）"
-          >
-            <i class="note-dot" :style="lastNote ? { background: `hsl(${lastNote.h}, 92%, 62%)` } : null"></i>
-            <template v-if="lastNote">第{{ lastNote.seq }}音 · {{ lastNote.name }}</template>
-            <template v-else>—</template>
-          </span>
-          <span class="audio-state" :class="audioChipCls" :title="audioChipTitle">
-            <i></i>{{ audioChipText }}
-          </span>
-          <button class="btn ghost sound" :class="{ muted }" @click="toggleMute" :title="muted ? '开启经过音效' : '关闭经过音效'">
-            <svg v-if="muted" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M11 5 6 9H2v6h4l5 4V5z" />
-              <line x1="23" y1="9" x2="17" y2="15" />
-              <line x1="17" y1="9" x2="23" y2="15" />
-            </svg>
-            <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M11 5 6 9H2v6h4l5 4V5z" />
-              <path d="M15.5 8.5a5 5 0 0 1 0 7" />
-              <path d="M18.5 5.5a9 9 0 0 1 0 13" />
-            </svg>
-            {{ muted ? '已静音' : '音效开' }}
-          </button>
-          <button class="btn ghost" @click="testSound" title="立即播放下一个音，用于验证声音并解锁浏览器限制">
-            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M9 18V5l12-2v13" />
-              <circle cx="6" cy="18" r="3" />
-              <circle cx="18" cy="16" r="3" />
-            </svg>
-            试听
-          </button>
-          <button class="btn ghost" @click="reset" title="重置：所有点回到原点 (R)">
-            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M3 12a9 9 0 1 0 3-6.7" />
-              <path d="M3 4v5h5" />
-            </svg>
-            重置
-          </button>
-          <button class="btn play" :class="{ paused: !playing }" @click="togglePlay" title="播放/暂停 (空格)">
-            <svg v-if="playing" viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
-              <rect x="6" y="5" width="4" height="14" rx="1" />
-              <rect x="14" y="5" width="4" height="14" rx="1" />
-            </svg>
-            <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
-              <path d="M8 5.5v13a1 1 0 0 0 1.5.9l11-6.5a1 1 0 0 0 0-1.8l-11-6.5A1 1 0 0 0 8 5.5Z" />
-            </svg>
-            {{ playing ? '暂停' : '播放' }}
-          </button>
-        </div>
-      </header>
-
-      <!-- 第二行：原底部控制栏（控制项） -->
-      <section class="dock-body">
-        <div class="panel-row controls-row">
-          <div class="pgroup grow">
-            <span class="plabel">演示倍速</span>
-            <div class="range-row">
-              <input
-                class="range"
-                type="range"
-                min="0.25"
-                max="10"
-                step="0.25"
-                v-model.number="speedScale"
-                title="等比缩放所有点的运动速度，不改变各层的相对快慢"
-              />
-              <output>×{{ speedScale }}</output>
-            </div>
-            <small>0s 全部从原点发散 → 90s 全部同时回归原点（默认 ×0.5 放慢观察）</small>
-          </div>
-
-          <div class="pgroup">
-            <span class="plabel">显示开关</span>
-            <label class="tick"><input type="checkbox" v-model="showLayerChord" />同层相邻点连线</label>
-            <label class="tick"><input type="checkbox" v-model="showRings" />圆形路径</label>
-            <label class="tick"><input type="checkbox" v-model="showEnv" />各层椭圆</label>
-            <small>共 {{ TOTAL_POINTS }} 点 · 仅同层相邻点相连（两端端点不连）</small>
-          </div>
-        </div>
-      </section>
-    </div>
+    <SimDock
+      ref="dockRef"
+      :playing="playing"
+      :muted="muted"
+      :show-count="false"
+      :speed="speedScale"
+      @toggle-play="togglePlay"
+      @toggle-mute="toggleMute"
+      @reset="reset"
+      @update:speed="(v) => (speedScale = v)"
+    />
   </div>
 </template>
 
@@ -823,16 +696,13 @@ if (AUDIO_DEBUG) {
   height: 100%;
 }
 
-/* ---------- 顶部总控条：header + panel 合并成一条悬浮玻璃卡片 ---------- */
+/* ---------- 顶部总控条：合并后的整体悬浮玻璃卡片 ---------- */
 .dock {
   position: absolute;
   top: 40px;                     /* 让开顶部居中的页面切换器 */
   left: clamp(8px, 1.6vw, 20px);
   right: clamp(8px, 1.6vw, 20px);
   z-index: 6;
-  display: flex;
-  flex-direction: column;
-  padding: 0 clamp(12px, 2vw, 24px);
   border: 1px solid var(--border);
   border-radius: 16px;
   background: linear-gradient(180deg, rgba(8, 13, 26, 0.92), rgba(15, 23, 42, 0.74));
@@ -840,72 +710,31 @@ if (AUDIO_DEBUG) {
   box-shadow: 0 14px 40px rgba(2, 6, 23, 0.5);
 }
 
-/* 第一行：状态与操作（无标题，整体居中排列） */
-.dock-head {
+/* 合并后的整体控制条：操作按钮 + 参数控件 一行流式排列 */
+.dock-inner {
   display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 14px;
   flex-wrap: wrap;
-  min-height: 44px;
-  padding: 8px 0;
+  flex-direction: row-reverse;
+  align-items: center;
+  gap: clamp(10px, 2vw, 22px);
+  padding: 10px clamp(12px, 2vw, 20px);
 }
-.header-actions {
-  display: flex;
-  gap: 10px;
+.actions {
+  display: inline-flex;
   align-items: center;
+  gap: 8px;
+  flex: none;
+}
+.controls {
+  display: flex;
   flex-wrap: wrap;
-  justify-content: center;
+  align-items: center;
+  gap: clamp(14px, 2.4vw, 36px);
+  flex: 1 1 auto;
   min-width: 0;
 }
-.note-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  padding: 5px 10px;
-  border-radius: 999px;
-  border: 1px solid rgba(148, 163, 184, 0.2);
-  background: rgba(15, 23, 42, 0.55);
-  color: var(--text-2);
-  white-space: nowrap;
-  transition: border-color 0.2s, box-shadow 0.2s;
-}
-.note-chip.lit {
-  border-color: rgba(56, 189, 248, 0.5);
-  box-shadow: 0 0 10px rgba(56, 189, 248, 0.18);
-  color: #e2e8f0;
-}
-.note-dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  flex: none;
-  background: var(--text-3);
-}
-.audio-state {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  padding: 5px 10px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: rgba(15, 23, 42, 0.55);
-  color: var(--text-2);
-  max-width: 230px;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.audio-state i { width: 7px; height: 7px; border-radius: 50%; background: var(--text-3); flex: none; }
-.audio-state.ok { border-color: rgba(74, 222, 128, 0.35); }
-.audio-state.ok i { background: #4ade80; box-shadow: 0 0 6px rgba(74, 222, 128, 0.8); }
-.audio-state.ok.muted i { background: #fbbf24; box-shadow: none; }
-.audio-state.warn { border-color: rgba(251, 191, 36, 0.4); color: #fcd34d; }
-.audio-state.warn i { background: #fbbf24; }
-.audio-state.notice { border-color: rgba(56, 189, 248, 0.4); color: #7dd3fc; }
-.audio-state.notice i { background: #38bdf8; }
+
+
 
 .btn {
   display: inline-flex;
@@ -937,106 +766,48 @@ if (AUDIO_DEBUG) {
 }
 .btn.play:hover { filter: brightness(1.08); }
 
-.icon-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 30px;
-  height: 30px;
-  border-radius: 9px;
-  flex: none;
-  border: 1px solid var(--border);
-  background: rgba(30, 41, 59, 0.6);
-  color: var(--text-2);
-  cursor: pointer;
-  transition: all 0.15s;
-}
-.icon-btn:hover { color: #e2e8f0; border-color: #38bdf8; background: rgba(56, 189, 248, 0.12); }
-
-/* 第二行：原底部控制栏内容，与第一行上下堆叠 */
-.dock-body {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 8px 0 10px;
-  border-top: 1px dashed rgba(148, 163, 184, 0.2);
-}
-.panel-row {
-  display: flex;
-  align-items: flex-end;
-  gap: clamp(16px, 3vw, 36px);
-  flex-wrap: wrap;
-}
 .pgroup { min-width: 150px; display: flex; flex-direction: column; gap: 6px; }
-.pgroup.grow { flex: 1; min-width: 220px; max-width: 440px; }
+.pgroup.grow { flex: 1; min-width: 200px; max-width: 440px; }
 .plabel { font-size: 12px; color: var(--text-2); letter-spacing: 0.5px; }
 small { font-size: 11px; color: var(--text-3); line-height: 1.4; }
 
-.seg {
-  display: inline-flex;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  overflow: hidden;
-  background: rgba(2, 6, 23, 0.55);
-}
-.seg-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 7px 13px;
-  border: none;
-  background: transparent;
-  color: var(--text-2);
-  font-size: 13px;
-  cursor: pointer;
-  transition: all 0.16s;
-  white-space: nowrap;
-}
-.seg-btn + .seg-btn { border-left: 1px solid var(--border); }
-.seg-btn:hover { color: #e2e8f0; }
-.seg-btn.on {
-  background: linear-gradient(135deg, rgba(14, 165, 233, 0.32), rgba(34, 211, 238, 0.18));
-  color: #e0f2fe;
-  font-weight: 600;
-}
-
-.range-row { display: flex; align-items: center; gap: 12px; }
-.range {
-  flex: 1;
+/* 倍速下拉 */
+.speed-select {
   appearance: none;
   -webkit-appearance: none;
-  height: 4px;
-  border-radius: 2px;
-  background: linear-gradient(90deg, #0ea5e9, #22d3ee);
-  outline: none;
-  cursor: pointer;
-}
-.range::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: #fff;
-  border: 3px solid var(--accent-2);
-  box-shadow: 0 2px 8px rgba(34, 211, 238, 0.5);
-  cursor: pointer;
-}
-.range::-moz-range-thumb {
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  background: #fff;
-  border: 3px solid var(--accent-2);
-  cursor: pointer;
-}
-output {
-  min-width: 74px;
-  text-align: right;
-  font-size: 13px;
-  font-weight: 600;
+  height: 34px;
+  width: 76px;
+  padding: 0 26px 0 10px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background-color: rgba(2, 6, 23, 0.7);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
   color: var(--text-1);
+  font-size: 14px;
   font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  outline: none;
+  transition: border 0.15s, box-shadow 0.15s;
 }
+.speed-select:focus {
+  border-color: #38bdf8;
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.18);
+}
+.pgroup.inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.pgroup.inline .plabel {
+  white-space: nowrap;
+}
+.pgroup.inline small {
+  display: none;
+}
+
 .tick {
   display: inline-flex;
   align-items: center;
@@ -1048,7 +819,5 @@ output {
 }
 .tick input { accent-color: #22d3ee; width: 14px; height: 14px; cursor: pointer; }
 
-@media (max-width: 1440px) { .dock-head .note-chip { display: none; } }
-@media (max-width: 1280px) { .dock-head .audio-state { display: none; } }
-@media (max-width: 1180px) { .dock-head .btn.sound { display: none; } }
+@media (max-width: 1080px) { .btn.sound { display: none; } }
 </style>

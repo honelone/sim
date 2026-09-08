@@ -1,101 +1,93 @@
 <script setup>
 import { onMounted, onBeforeUnmount, ref, computed } from 'vue'
+import SimDock from './SimDock.vue'
 
 /* =========================================================
  * 需求映射：
- *  1. 页面正中间绘制一个圆形路径，作为运动点运行轨道
- *  2. 圆形路径最顶部放置一个固定原点
- *  3. 12 个运动点从原点出发，沿圆形路径顺时针/逆时针运行，
- *     方向由用户控制（默认逆时针）；切向时相位镜像保持位置连续
- *  4. 各点速度不同：60s 内第 1 点 1 圈、第 2 点 2 圈 … 第 12 点 12 圈
- *  5. 各点按彩虹色序着色（红→橙→黄→绿→青→蓝→紫…均匀取样）
- *  6. 顶部/底部内容展示风格与 ArcBounceSim（半圆往返页面）保持一致
- *  7. 连线：各运动点两两之间 + 每点与原点之间；连线均比圆形轨道更淡
- *  8. 点经过原点（每跑完一圈）即发声：按点序号 do re mi fa sol la si，
- *     超过 7 个则升一个八度循环（点 8~12 = do'~sol'）
+ *  1. 全部运动点沿同一椭圆轨道运动（点尺寸略大，居中）
+ *  2. 自然大调 7 个音高（do re mi fa sol la si）各分配一个运动点 → 共 7 个
+ *  3. 每个点的运动周期 = 该音音符时值 × 整体缩放；相邻音依次放慢，
+ *     形成“由快到慢”的优美视觉节奏；整体缩放可调（倍速）
+ *  4. 和弦连线：7 个点的实时位置两两连线，构成随时间呼吸的星形多边形
+ *  5. 连线状态可切换：显示 / 隐藏（默认显示）
+ *  6. 每个运动点用音高对应颜色（彩虹七色），轨道用较淡同色
+ *  7. 顶部/底部信息展示与既有实验页保持同一视觉语言
  * ========================================================= */
 
 /* ---------- 常量 ---------- */
-const TOTAL_POINTS = 12        // 运动点数量（固定）
-const LAP_SECONDS = 60         // 定义周期：第 n 点每 60s 运行 n 圈
-const MAX_FRAME = 0.05         // 单帧最大 dt（防后台切回跳变）
-const RING_ALPHA = 0.5         // 圆形轨道不透明度
-const SPOKE_ALPHA = 0.16       // 点-原点连线不透明度（< RING_ALPHA）
-const CHORD_ALPHA = 0.1        // 点间连线不透明度（< RING_ALPHA）
-const ORIGIN_R = 7             // 原点半径
-const AUDIO_DEBUG = true       // 调试开关：true 时暴露 window.__orbitAudio
-
-// 音阶：do re mi fa sol la si（自然大调 C4~B4）
-const NOTE_FREQS = [261.63, 293.66, 329.63, 349.23, 392.0, 440.0, 493.88]
 const NOTE_NAMES = ['do', 're', 'mi', 'fa', 'sol', 'la', 'si']
-const HUE_STEP = 360 / TOTAL_POINTS
+const NOTE_FREQS = [261.63, 293.66, 329.63, 349.23, 392.0, 440.0, 493.88]
+const BEAT = 0.6                  // 基础音符时值（秒），整体缩放基准
+const MIN_FRAME = 0.05            // 单帧最大 dt
+const DEFAULT_SPEED = 1           // 默认倍速（下拉选项 1x/2x/5x/10x）
+const RING_BASE_ALPHA = 0.75      // 轨道基础不透明度（最亮）
+const CHORD_ALPHA = 0.32          // 连线不透明度
+const ORBIT_CX_RATIO = 0.5
+const ORBIT_CY_RATIO = 0.56
+const AUDIO_DEBUG = true
 
+// 彩虹七色（红橙黄绿蓝靛紫），与音阶一一对应
+const RAINBOW_HUES = [0, 30, 55, 130, 205, 240, 285]
 function hsl(h, s, l) { return `hsl(${h}, ${s}%, ${l}%)` }
 function hsla(h, s, l, a) { return `hsla(${h}, ${s}%, ${l}%, ${a})` }
 
-// 每个点预生成颜色 + 音符信息（点序号与音符/颜色一一对应）
-const DOTS = Array.from({ length: TOTAL_POINTS }, (_, i) => {
-  const h = Math.round(i * HUE_STEP) % 360
-  const semi = i % 7
-  const oct = Math.floor(i / 7)
+// 7 个音的运动周期：do 最快，依次放慢（倍数随音序号递增）
+const POINTS = NOTE_NAMES.map((name, i) => {
+  const h = RAINBOW_HUES[i]
   return {
-    i, num: i + 1, h,
+    i,
+    name,
+    freq: NOTE_FREQS[i],
+    h,
     color: hsl(h, 92, 62),
     light: hsl(h, 96, 82),
     dark: hsl(h, 88, 44),
-    freq: NOTE_FREQS[semi] * Math.pow(2, oct),
-    name: oct > 0 ? `${NOTE_NAMES[semi]}′` : NOTE_NAMES[semi],
-    title: oct > 0 ? `${NOTE_NAMES[semi]}（升八度）` : NOTE_NAMES[semi],
+    period: BEAT * (1 + i * 0.55),  // 相邻音依次放慢，形成由快到慢的节奏
   }
 })
+const N = POINTS.length
 
-/* ---------- 交互状态（响应式） ---------- */
-const direction = ref('ccw')       // ccw 逆时针 / cw 顺时针（默认逆时针）
-const speedScale = ref(1)          // 演示倍速（等比压缩周期，不影响 n:1 圈速比）
+/* ---------- 交互状态 ---------- */
+const speedScale = ref(DEFAULT_SPEED)
 const playing = ref(false)
 const muted = ref(false)
-const showChord = ref(true)        // 是否绘制点间连线
-const showSpoke = ref(true)        // 是否绘制点-原点连线
-const lastNote = ref(null)         // 最近一次经过原点奏响的音符
-
-const dirSign = computed(() => (direction.value === 'ccw' ? 1 : -1))
-const directionText = computed(() => (direction.value === 'ccw' ? '逆时针' : '顺时针'))
-
-// 音频解锁状态：idle | starting | ready | blocked | unsupported
-const audioState = ref('idle')
-const audioNotice = ref('')
-const blockedClicks = ref(0)
+const showChord = ref(true)
+const direction = ref(1)           // 1 顺时针 / -1 逆时针
+const lastNote = ref(null)         // 最近一次发声的音符（名称+颜色）
+const activeIdx = ref(-1)         // 当前高亮发声的点（图例联动）
 
 const canvasRef = ref(null)
 const stageRef = ref(null)
-const dockEl = ref(null)   // 顶部总控条（header + panel 合并后的一体容器）
-
-/* ---------- 音频运行时（非响应式） ---------- */
-let audioCtx = null            // AudioContext
-let masterGain = null          // 主音量节点
-let pendingNotes = []          // ctx 未就绪时排队待补发的音符
-let resumePromise = null
-let audioRetryTimer = 0
-let noticeTimer = 0
-let lastResumeProbe = 0
-const audioStats = { builds: 0, unlockCalls: 0, notesScheduled: 0, notesFlushed: 0, noteAttempts: 0, passes: 0 }
+const dockRef = ref(null)   // 顶部总控条（SimDock 组件根，供 layout 测量遮挡高度）
 
 /* ---------- 运行时非响应式数据 ---------- */
 const sim = {
   w: 0, h: 0, dpr: 1,
-  cx: 0, cy: 0, R: 0,
-  pts: DOTS.map((d) => ({ i: d.i, num: d.num, f: 0 })), // f∈[0,1) 圈内相位（0=原点）
-  ripples: [],                                          // 经过原点时的冲击波纹
+  cx: 0, cy: 0, R: 0,           // 椭圆基准：以圆近似，再按宽高比例拉伸
+  rx: 0, ry: 0, dotR: 7,
+  ripples: [],
+  pos: new Float64Array(N * 2),  // 每个点的实时坐标
 }
+const orbit = Array.from({ length: N }, () => ({ phase: 0, angle: 0 }))
 
-/* ---------- 计时 ---------- */
+let rafId = 0
+let lastTs = 0
+let resizeObserver = null
 let realElapsed = 0
 let virtElapsed = 0
-let rafId = 0                  // requestAnimationFrame id
-let lastTs = 0                 // 上一帧时间戳
-let resizeObserver = null      // 画布尺寸自适应
 
-/* ---------- 几何布局：圆居中，原点位于轨道最顶部 ---------- */
+/* ---------- 音频 runtime ---------- */
+let audioCtx = null
+let masterGain = null
+let resumePromise = null
+let audioRetryTimer = 0
+let noticeTimer = 0
+let highlightTimer = 0
+let lastResumeProbe = 0
+let pendingSeq = []
+const audioStats = { builds: 0, unlockCalls: 0, noteAttempts: 0, notesScheduled: 0, passes: 0 }
+
+/* ---------- 布局 ---------- */
 function layout() {
   const canvas = canvasRef.value
   const stage = stageRef.value
@@ -111,27 +103,32 @@ function layout() {
   canvas.width = Math.round(w * dpr)
   canvas.height = Math.round(h * dpr)
 
-  // header 与 panel 已合并为顶部一条总控条：直接测量它实际遮挡的顶部高度（含与顶部的间距）
-  const padT = (dockEl.value ? dockEl.value.getBoundingClientRect().bottom - rect.top : 150) + 18
-  const padB = 24
+  // 顶部总控条已合并为一条：直接测量它实际遮挡的顶部高度（含与顶部的间距）
+  const padT = (dockRef.value && dockRef.value.root ? dockRef.value.root.getBoundingClientRect().bottom - rect.top : 200) + 30
+  const padB = 26
   const regionTop = padT
-  const regionBottom = Math.max(padT + 80, h - padB)
+  const regionBottom = Math.max(padT + 120, h - padB)
   const regionH = regionBottom - regionTop
 
-  sim.cx = w / 2
+  sim.cx = w * ORBIT_CX_RATIO
   sim.cy = regionTop + regionH / 2
-  sim.R = Math.max(40, Math.min(w / 2 - 56, regionH / 2 - 8))
+  const availH = regionH
+  const availW = w * 0.84
+  sim.rx = Math.max(60, Math.min(availW / 2 - 24, availH * 1.35))
+  sim.ry = Math.max(48, Math.min(availH / 2 - 14, sim.rx * 0.66))
+  sim.dotR = Math.max(5, Math.min(9, sim.rx * 0.02))
 }
 
-/* ---------- 重置 / 播放 / 方向 ---------- */
+/* ---------- 控制 ---------- */
 function reset() {
   playing.value = false
-  unlockAudio() // 重置按钮在用户手势内，顺带解锁音频
+  unlockAudio()
   sim.ripples.length = 0
-  for (const p of sim.pts) p.f = 0
   realElapsed = 0
   virtElapsed = 0
   lastNote.value = null
+  activeIdx.value = -1
+  for (const o of orbit) { o.phase = 0; o.angle = 0 }
 }
 
 function togglePlay() {
@@ -145,38 +142,30 @@ function toggleMute() {
   flashNotice(muted.value ? '声音已关闭（静音）' : '声音已开启', 1400)
 }
 
-// 相位镜像：切换方向时保持各点当前屏幕位置不变，仅让后续运动反向
-function mirrorPhase() {
-  for (const p of sim.pts) if (p.f !== 0) p.f = 1 - p.f
-}
-
 function setDirection(dir) {
-  if (direction.value === dir) return
   direction.value = dir
-  mirrorPhase()
-}
-
-function toggleDirection() {
-  setDirection(direction.value === 'ccw' ? 'cw' : 'ccw')
+  flashNotice(dir > 0 ? '顺时针' : '逆时针', 1200)
 }
 
 /* =========================================================
  * 音频：Web Audio 实时合成（无外部文件）
+ * 每个运动点经过椭圆最右侧（即“12 点钟”最高点）时奏响其对应音，
+ * 音高 = do re mi fa sol la si（按点序），并做最小间隔节流。
  * ========================================================= */
 function buildAudioGraph() {
   if (audioCtx && audioCtx.state !== 'closed') return true
   if (audioCtx) { audioCtx = null; masterGain = null }
   const AC = window.AudioContext || window['webkitAudioContext']
-  if (!AC) { audioState.value = 'unsupported'; return false }
+  if (!AC) { return false }
   try {
     audioCtx = new AC()
     audioCtx.addEventListener('statechange', onAudioStateChange)
     masterGain = audioCtx.createGain()
-    masterGain.gain.value = 0.5
+    masterGain.gain.value = 0.34
     const comp = audioCtx.createDynamicsCompressor()
     comp.threshold.value = -16
     comp.knee.value = 20
-    comp.ratio.value = 6
+    comp.ratio.value = 8
     comp.attack.value = 0.003
     comp.release.value = 0.25
     masterGain.connect(comp)
@@ -187,7 +176,6 @@ function buildAudioGraph() {
     try { audioCtx && audioCtx.close() } catch (e) {}
     audioCtx = null
     masterGain = null
-    audioState.value = 'blocked'
     return false
   }
   return true
@@ -196,8 +184,6 @@ function buildAudioGraph() {
 function onAudioStateChange() {
   if (!audioCtx) return
   if (audioCtx.state === 'running') {
-    audioState.value = 'ready'
-    blockedClicks.value = 0
     flushPending()
     if (audioRetryTimer) { clearTimeout(audioRetryTimer); audioRetryTimer = 0 }
   }
@@ -206,17 +192,11 @@ function onAudioStateChange() {
 function unlockAudio() {
   if (!buildAudioGraph()) return Promise.resolve(false)
   audioStats.unlockCalls++
-  if (audioCtx.state === 'running') { audioState.value = 'ready'; return Promise.resolve(true) }
+  if (audioCtx.state === 'running') { return Promise.resolve(true) }
   if (audioCtx.state === 'suspended' && !resumePromise) {
-    audioState.value = 'starting'
     resumePromise = audioCtx.resume().then(
       () => { resumePromise = null; return !!(audioCtx && audioCtx.state === 'running') },
-      () => {
-        resumePromise = null
-        audioState.value = 'blocked'
-        scheduleRetry()
-        return false
-      }
+      () => { resumePromise = null; scheduleRetry(); return false }
     )
   }
   return resumePromise || Promise.resolve(false)
@@ -231,18 +211,20 @@ function scheduleRetry() {
 }
 
 function flashNotice(text, ms = 2600) {
-  audioNotice.value = text
-  clearTimeout(noticeTimer)
-  noticeTimer = setTimeout(() => (audioNotice.value = ''), ms)
+  if (noticeTimer) clearTimeout(noticeTimer)
+  noticeTimer = setTimeout(() => { noticeTimer = 0 }, ms)
+  void text
 }
 
 function flushPending() {
-  if (!pendingNotes.length || !audioCtx || audioCtx.state !== 'running') return
-  const batch = pendingNotes.splice(0)
-  for (const i of batch) { try { if (scheduleNoteNow(i)) audioStats.notesFlushed++ } catch (e) {} }
+  if (!pendingSeq.length || !audioCtx || audioCtx.state !== 'running') return
+  const batch = pendingSeq.splice(0)
+  for (const seq of batch) {
+    try { if (scheduleNoteNow(seq)) audioStats.notesScheduled++ } catch (e) {}
+  }
 }
 
-// 弹奏单个正弦音（指数衰减，钟琴质感）
+// 单音：指数衰减（钟琴质感），附带一个高八度泛音“叮”
 function strike(freq, t0, type, peak, decay) {
   if (!audioCtx || !masterGain) return
   const osc = audioCtx.createOscillator()
@@ -250,57 +232,52 @@ function strike(freq, t0, type, peak, decay) {
   osc.type = type
   osc.frequency.value = freq
   g.gain.setValueAtTime(0.0001, t0)
-  g.gain.exponentialRampToValueAtTime(peak, t0 + 0.006)
+  g.gain.exponentialRampToValueAtTime(peak, t0 + 0.005)
   g.gain.exponentialRampToValueAtTime(0.0001, t0 + decay)
   osc.connect(g)
   g.connect(masterGain)
   osc.start(t0)
-  osc.stop(t0 + decay + 0.06)
+  osc.stop(t0 + decay + 0.05)
   osc.onended = () => { osc.disconnect(); g.disconnect() }
 }
 
-// 真正调度音符：仅在 ctx running 且未静音时执行
-function scheduleNoteNow(i) {
+// 顶点（12 点钟）发声：只有当 ctx 处于 running 且未静音时“真正”发出
+function scheduleNoteNow(seq) {
   if (muted.value || !audioCtx || !masterGain || audioCtx.state !== 'running') return false
+  const f = POINTS[seq].freq
   const t0 = audioCtx.currentTime
-  const f = DOTS[i].freq
   try {
-    strike(f, t0, 'sine', 0.5, 1.0)              // 基音
-    strike(f * 2.01, t0, 'sine', 0.12, 0.3)     // 八度泛音“叮”
-    strike(f * 4.07, t0, 'sine', 0.05, 0.12)    // 高频亮色
-    audioStats.notesScheduled++
+    strike(f, t0, 'sine', 0.5, 0.85)
+    strike(f * 2.01, t0, 'sine', 0.12, 0.26)
     return true
-  } catch (err) { console.warn('音符调度失败', err); return false }
-}
-
-// 第 i 个点经过原点时发声；ctx 未解锁时入队待补发
-function playPassNote(i) {
-  audioStats.noteAttempts++
-  if (muted.value) return
-  if (audioCtx && audioCtx.state === 'running') { scheduleNoteNow(i); return }
-  if (buildAudioGraph()) {
-    if (pendingNotes.length < 32) pendingNotes.push(i)
-    unlockAudio()
+  } catch (err) {
+    console.warn('音符调度失败', err)
+    return false
   }
 }
 
-// “试听”按钮：用户手势内解锁并弹一个 do
-async function testSound() {
-  if (muted.value) { flashNotice('已静音：请先点击“音效开/静音”开启声音', 2400); return }
-  const ok = await unlockAudio()
-  if (audioState.value === 'unsupported') { flashNotice('当前浏览器不支持 Web Audio，无法发声', 3800); return }
-  if (!ok || (audioCtx && audioCtx.state !== 'running')) {
-    blockedClicks.value++
-    if (blockedClicks.value >= 2) {
-      flashNotice('浏览器一直拦截本站声音：请点地址栏左侧图标→将本站设为“允许声音”，或在新标签页打开本页后重试', 5200)
-    } else {
-      flashNotice('音频被浏览器拦截：本次点击即是解锁动作，请再点一次“试听”', 3600)
-    }
+// 点经过椭圆最右端（角度约 -90°，即 12 点钟顶点）时触发
+function onVertex(i) {
+  audioStats.passes++
+  const p = POINTS[i]
+  if (sim.ripples.length < 16) sim.ripples.push({ x: sim.pos[i * 2], y: sim.pos[i * 2 + 1], age: 0, h: p.h })
+  lastNote.value = { name: p.name, color: p.color, title: `${p.name}（${p.freq.toFixed(0)}Hz）` }
+  activeIdx.value = i
+  clearTimeout(highlightTimer)
+  highlightTimer = setTimeout(() => { activeIdx.value = -1 }, 320)
+}
+
+function playNote(seq) {
+  if (muted.value) return
+  audioStats.noteAttempts++
+  if (audioCtx && audioCtx.state === 'running') {
+    if (scheduleNoteNow(seq)) audioStats.notesScheduled++
     return
   }
-  blockedClicks.value = 0
-  const played = scheduleNoteNow(0)
-  flashNotice(played ? '已播放 do 试听音；若仍听不到：检查系统音量/耳机、标签页是否被静音' : '试听调度失败：请检查系统音量与输出设备', 4600)
+  if (buildAudioGraph()) {
+    if (pendingSeq.length < 16) pendingSeq.push(seq)
+    unlockAudio()
+  }
 }
 
 function audioSupervisor() {
@@ -312,237 +289,167 @@ function audioSupervisor() {
   }
 }
 
-const audioChipText = computed(() => {
-  if (audioNotice.value) return audioNotice.value
-  switch (audioState.value) {
-    case 'idle': return '音频：待启动'
-    case 'starting': return '音频：解锁中…'
-    case 'ready': return muted.value ? '音频：就绪 · 已静音' : '音频：就绪'
-    case 'blocked': return '⚠ 音频被浏览器拦截'
-    case 'unsupported': return '⚠ 不支持 Web Audio'
-    default: return '音频：未知状态'
-  }
-})
-const audioChipCls = computed(() => {
-  if (audioNotice.value) return 'notice'
-  return audioState.value === 'ready' ? (muted.value ? 'ok muted' : 'ok') : 'warn'
-})
-const audioChipTitle = computed(() => {
-  if (audioState.value === 'blocked') {
-    return '浏览器自动播放策略拦截了本站音频。请连续点击“试听”1~2 次（点击本身即解锁动作）；若仍失败，请点击地址栏左侧图标将本站设为“允许声音”'
-  }
-  if (audioState.value === 'ready') {
-    return '音频已就绪：Web Audio 实时合成（无外部文件）。若听不到声音请检查系统音量/输出设备/标签页是否被静音'
-  }
-  return '经过音效由 Web Audio 实时合成；首次使用请点击“试听”或“播放”解锁'
-})
-
-/* ---------- 运动物理：点速 = 序号 n 圈/60s，圈相位在原点处清零检测 ---------- */
-function triggerPass(i) {
-  audioStats.passes++
-  playPassNote(i)
-  const ox = sim.cx
-  const oy = sim.cy - sim.R
-  sim.ripples.push({ x: ox, y: oy, age: 0, h: DOTS[i].h })
-  if (sim.ripples.length > 20) sim.ripples.shift()
-  lastNote.value = { num: DOTS[i].num, name: DOTS[i].name, color: DOTS[i].color, title: DOTS[i].title }
-}
-
+/* ---------- 运动 ---------- */
 function updateSim(dt) {
   const scale = Number(speedScale.value) || 1
-  const d = dirSign.value
   realElapsed += dt
   virtElapsed += dt * scale
-  for (const p of sim.pts) {
-    const step = (d * p.num * scale * dt) / LAP_SECONDS // 本帧移动量（圈）
-    const raw = p.f + step
-    const crossed = Math.floor(raw)                     // f∈[0,1)：floor 即跨过原点的整圈数
-    if (crossed !== 0) {
-      const c = Math.abs(crossed)
-      for (let k = 0; k < c; k++) triggerPass(p.i)
-    }
-    p.f = raw - Math.floor(raw)
+  for (let i = 0; i < N; i++) {
+    const o = orbit[i]
+    // 角速度 = 2π / 周期
+    const w = (2 * Math.PI) / POINTS[i].period
+    const prevAngle = o.angle
+    o.angle += direction.value * w * dt * scale
+    o.phase += direction.value * w * dt * scale
+    // 经过椭圆最右端（角度约 -90°，即 12 点钟顶点）时触发发声与波纹
+    let a = o.angle - prevAngle
+    // 归一化到 [-π, π]，判断是否跨过 -π/2（顶部）
+    let crossed = false
+    let t = Math.atan2(Math.sin(prevAngle + Math.PI / 2), Math.cos(prevAngle + Math.PI / 2))
+    let t2 = Math.atan2(Math.sin(o.angle + Math.PI / 2), Math.cos(o.angle + Math.PI / 2))
+    // 跨过 π→-π 边界处理
+    if (t2 - t > Math.PI) t2 -= 2 * Math.PI
+    if (t - t2 > Math.PI) t2 += 2 * Math.PI
+    crossed = (t <= 0 && t2 >= 0) || (t >= 0 && t2 <= 0)
+    void a
+    if (crossed) onVertex(i), playNote(i)
   }
   for (let i = sim.ripples.length - 1; i >= 0; i--) {
     sim.ripples[i].age += dt
-    if (sim.ripples[i].age > 0.8) sim.ripples.splice(i, 1)
+    if (sim.ripples[i].age > 0.7) sim.ripples.splice(i, 1)
   }
 }
 
 /* ---------- 渲染 ---------- */
-function posOf(f, R) {
-  const rr = R === undefined ? sim.R : R
-  const th = Math.PI * 2 * f
-  const d = dirSign.value // CCW(d=1)：相位增大 → 顶部→左→下→右（视觉逆时针）
-  return {
-    x: sim.cx - d * rr * Math.sin(th),
-    y: sim.cy - rr * Math.cos(th),
-  }
-}
-
 function render() {
   const canvas = canvasRef.value
   if (!canvas || !sim.w) return
+  updatePositions()
   const ctx = canvas.getContext('2d')
   ctx.setTransform(sim.dpr, 0, 0, sim.dpr, 0, 0)
   ctx.clearRect(0, 0, sim.w, sim.h)
   drawRing(ctx)
-  drawConnectors(ctx)
+  drawChords(ctx)
   drawRipples(ctx)
   drawOrigin(ctx)
   drawDots(ctx)
 }
 
-// 圆形轨道（页面正中）
+function updatePositions() {
+  for (let i = 0; i < N; i++) {
+    const o = orbit[i]
+    // 椭圆参数：以最右端为起点（角度 -90° 即 12 点钟），顺时针运动
+    const ang = o.angle
+    sim.pos[i * 2] = sim.cx + sim.rx * Math.cos(ang)
+    sim.pos[i * 2 + 1] = sim.cy + sim.ry * Math.sin(ang)
+  }
+}
+
+// 轨道（较淡的彩虹七色描边）
 function drawRing(ctx) {
-  const { cx, cy, R } = sim
   ctx.save()
-  ctx.lineCap = 'round'
-  // 外层柔光
-  ctx.beginPath()
-  ctx.arc(cx, cy, R, 0, Math.PI * 2)
-  ctx.strokeStyle = 'rgba(56,189,248,0.10)'
-  ctx.lineWidth = 12
-  ctx.stroke()
-  // 主轨道
-  const grad = ctx.createRadialGradient(cx, cy, R - 8, cx, cy, R + 8)
-  grad.addColorStop(0, 'rgba(125,211,252,0.1)')
-  grad.addColorStop(0.5, `rgba(148,210,253,${RING_ALPHA})`)
-  grad.addColorStop(1, 'rgba(125,211,252,0.1)')
-  ctx.beginPath()
-  ctx.arc(cx, cy, R, 0, Math.PI * 2)
-  ctx.strokeStyle = grad
   ctx.lineWidth = 1.6
-  ctx.stroke()
+  for (let i = 0; i < N; i++) {
+    const p = POINTS[i]
+    ctx.strokeStyle = hsla(p.h, 90, 65, RING_BASE_ALPHA * 0.6)
+    ctx.beginPath()
+    ctx.ellipse(sim.cx, sim.cy, sim.rx, sim.ry, 0, 0, Math.PI * 2)
+    ctx.stroke()
+  }
   ctx.restore()
 }
 
-// 各点与原点连线 + 各运动点两两连线（都比轨道淡）
-function drawConnectors(ctx) {
-  if (showSpoke.value || showChord.value) {
-    ctx.save()
-    ctx.lineCap = 'round'
-  }
-  const ox = sim.cx
-  const oy = sim.cy - sim.R // 原点=轨道最顶部
-  const n = sim.pts.length
-
-  // 每个运动点 → 原点
-  if (showSpoke.value) {
-    ctx.lineWidth = 1
-    for (const p of sim.pts) {
-      const pt = posOf(p.f)
-      ctx.strokeStyle = hsla(DOTS[p.i].h, 92, 66, SPOKE_ALPHA)
-      ctx.beginPath()
-      ctx.moveTo(ox, oy)
-      ctx.lineTo(pt.x, pt.y)
-      ctx.stroke()
+// 和弦连线：7 个点两两相连，构成随时间呼吸的星形多边形
+function drawChords(ctx) {
+  if (!showChord.value) return
+  const pos = sim.pos
+  ctx.save()
+  ctx.lineCap = 'round'
+  ctx.lineJoin = 'round'
+  ctx.lineWidth = 1.4
+  ctx.strokeStyle = `rgba(186,230,253,${CHORD_ALPHA})`
+  ctx.beginPath()
+  for (let i = 0; i < N; i++) {
+    for (let j = i + 1; j < N; j++) {
+      ctx.moveTo(pos[i * 2], pos[i * 2 + 1])
+      ctx.lineTo(pos[j * 2], pos[j * 2 + 1])
     }
   }
-
-  // 各运动点两两之间
-  if (showChord.value) {
-    ctx.lineWidth = 0.8
-    ctx.strokeStyle = `rgba(190,214,255,${CHORD_ALPHA})`
-    for (let i = 0; i < n; i++) {
-      const a = posOf(sim.pts[i].f)
-      for (let j = i + 1; j < n; j++) {
-        const b = posOf(sim.pts[j].f)
-        ctx.beginPath()
-        ctx.moveTo(a.x, a.y)
-        ctx.lineTo(b.x, b.y)
-        ctx.stroke()
-      }
-    }
-  }
+  ctx.stroke()
   ctx.restore()
 }
 
 function drawRipples(ctx) {
+  if (!sim.ripples.length) return
   ctx.save()
   for (const r of sim.ripples) {
-    const t = Math.min(r.age / 0.8, 1)
-    const rad = 8 + t * (sim.R * 0.16)
+    const t = Math.min(r.age / 0.7, 1)
     ctx.beginPath()
-    ctx.arc(r.x, r.y, rad, 0, Math.PI * 2)
-    ctx.strokeStyle = hsla(r.h ?? DOTS[0].h, 92, 68, (1 - t) * 0.7)
-    ctx.lineWidth = 2
+    ctx.arc(r.x, r.y, 8 + t * 30, 0, Math.PI * 2)
+    ctx.strokeStyle = hsla(r.h ?? 0, 92, 70, (1 - t) * 0.6)
+    ctx.lineWidth = 1.8
     ctx.stroke()
   }
   ctx.restore()
 }
 
-// 固定原点（轨道最顶部）
+// 中心原点（七色光晕，寓意和弦中心）
 function drawOrigin(ctx) {
-  const { cx } = sim
-  const oy = sim.cy - sim.R
+  const { cx, cy } = sim
   ctx.save()
-  // 外发光
-  const glow = ctx.createRadialGradient(cx, oy, 2, cx, oy, ORIGIN_R * 3.4)
-  glow.addColorStop(0, 'rgba(253,224,71,0.4)')
-  glow.addColorStop(1, 'rgba(253,224,71,0)')
+  let glow = ctx.createRadialGradient(cx, cy, 2, cx, cy, 30)
+  const stops = POINTS.map((p, k) => [k / (N - 1), p.color])
+  glow.addColorStop(0, 'rgba(255,255,255,0.9)')
+  for (const [pos, color] of stops) glow.addColorStop(pos, hsla(POINTS[Math.round(pos * (N - 1))].h, 92, 65, 0.25))
+  glow.addColorStop(1, 'rgba(255,255,255,0)')
   ctx.fillStyle = glow
   ctx.beginPath()
-  ctx.arc(cx, oy, ORIGIN_R * 3.4, 0, Math.PI * 2)
+  ctx.arc(cx, cy, 30, 0, Math.PI * 2)
   ctx.fill()
-  // 主体
-  const body = ctx.createRadialGradient(cx - 2, oy - 3, 1, cx, oy, ORIGIN_R + 2)
-  body.addColorStop(0, '#fff7ed')
-  body.addColorStop(0.55, '#fcd34d')
-  body.addColorStop(1, '#f59e0b')
-  ctx.fillStyle = body
+  ctx.fillStyle = 'rgba(226,232,240,0.9)'
   ctx.beginPath()
-  ctx.arc(cx, oy, ORIGIN_R, 0, Math.PI * 2)
+  ctx.arc(cx, cy, 4, 0, Math.PI * 2)
   ctx.fill()
-  ctx.strokeStyle = 'rgba(255,255,255,0.92)'
-  ctx.lineWidth = 1.4
-  ctx.stroke()
-  ctx.fillStyle = '#ffffff'
-  ctx.beginPath()
-  ctx.arc(cx, oy, 1.8, 0, Math.PI * 2)
-  ctx.fill()
-  // 文字标签
-  ctx.font = '11px system-ui, "Microsoft YaHei", sans-serif'
-  ctx.textAlign = 'center'
-  ctx.fillStyle = 'rgba(252,211,77,0.85)'
-  ctx.fillText('原点', cx, oy - ORIGIN_R - 8)
   ctx.restore()
 }
 
-// 运动点（彩虹着色球体）
 function drawDots(ctx) {
-  const dotR = Math.max(4, Math.min(7.5, sim.R * 0.024))
-  for (const p of sim.pts) {
-    const pt = posOf(p.f)
-    const c = DOTS[p.i]
-    ctx.save()
-    // 色晕
-    ctx.shadowColor = c.color
-    ctx.shadowBlur = 12
-    const g = ctx.createRadialGradient(
-      pt.x - dotR * 0.35, pt.y - dotR * 0.42, dotR * 0.12,
-      pt.x, pt.y, dotR * 1.25
-    )
+  const pos = sim.pos
+  const dotR = sim.dotR
+  const active = activeIdx.value
+  for (let i = 0; i < N; i++) {
+    const p = POINTS[i]
+    const x = pos[i * 2]
+    const y = pos[i * 2 + 1]
+    const glow = ctx.createRadialGradient(x, y, 1, x, y, dotR * 3)
+    glow.addColorStop(0, hsla(p.h, 92, 66, 0.45))
+    glow.addColorStop(1, hsla(p.h, 92, 66, 0))
+    ctx.fillStyle = glow
+    ctx.beginPath()
+    ctx.arc(x, y, dotR * 3, 0, Math.PI * 2)
+    ctx.fill()
+
+    const g = ctx.createRadialGradient(x - dotR * 0.35, y - dotR * 0.42, dotR * 0.15, x, y, dotR * 1.3)
     g.addColorStop(0, '#ffffff')
-    g.addColorStop(0.35, c.light)
-    g.addColorStop(0.75, c.color)
-    g.addColorStop(1, c.dark)
+    g.addColorStop(0.4, p.light)
+    g.addColorStop(0.8, p.color)
+    g.addColorStop(1, p.dark)
     ctx.fillStyle = g
     ctx.beginPath()
-    ctx.arc(pt.x, pt.y, dotR, 0, Math.PI * 2)
+    ctx.arc(x, y, dotR, 0, Math.PI * 2)
     ctx.fill()
-    ctx.shadowBlur = 0
-    ctx.strokeStyle = 'rgba(255,255,255,0.75)'
-    ctx.lineWidth = 1
-    ctx.stroke()
-    ctx.restore()
+    if (i === active) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.95)'
+      ctx.lineWidth = 2
+      ctx.stroke()
+    }
   }
 }
 
 /* ---------- 主循环 ---------- */
 function tick(ts) {
   rafId = requestAnimationFrame(tick)
-  const dt = lastTs ? Math.min(Math.max((ts - lastTs) / 1000, 0), MAX_FRAME) : 0
+  const dt = lastTs ? Math.min(Math.max((ts - lastTs) / 1000, 0), MIN_FRAME) : 0
   lastTs = ts
   if (playing.value) {
     updateSim(dt)
@@ -552,20 +459,18 @@ function tick(ts) {
 }
 
 function onUserGesture() { unlockAudio() }
-
 function onKeydown(e) {
   if (e.code === 'Space' && e.target.tagName !== 'INPUT' && e.target.tagName !== 'BUTTON') {
     e.preventDefault()
     togglePlay()
   } else if (e.key === 'r' || e.key === 'R') {
     reset()
-  } else if (e.key === 'd' || e.key === 'D') {
-    toggleDirection()
   }
 }
 
 onMounted(() => {
   layout()
+  render()
   rafId = requestAnimationFrame(tick)
   resizeObserver = new ResizeObserver(() => layout())
   resizeObserver.observe(stageRef.value)
@@ -582,6 +487,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', onUserGesture)
   clearTimeout(audioRetryTimer)
   clearTimeout(noticeTimer)
+  clearTimeout(highlightTimer)
   if (audioCtx && audioCtx.state !== 'closed') {
     audioCtx.close().catch(() => {})
     audioCtx = null
@@ -593,7 +499,9 @@ if (AUDIO_DEBUG) {
   window.__orbitAudio = {
     get ctxState() { return audioCtx ? audioCtx.state : 'none' },
     get playing() { return playing.value },
-    get direction() { return direction.value },
+    get speed() { return speedScale.value },
+    get chord() { return showChord.value },
+    get dir() { return direction.value },
     stats: audioStats,
     unlock: () => unlockAudio(),
   }
@@ -602,123 +510,21 @@ if (AUDIO_DEBUG) {
 
 <template>
   <div class="sim-root">
-    <!-- 主运行区：画布占满视口，信息条悬浮其上 -->
     <div class="stage" ref="stageRef">
       <canvas ref="canvasRef" class="sim-canvas"></canvas>
     </div>
 
-      <!-- ================= 顶部总控条：状态/操作 + 控制 合并为一条悬浮卡片 ================= -->
-      <div class="dock" ref="dockEl">
-        <!-- 第一行：状态与操作（已移除标题与计时显示） -->
-        <header class="dock-head">
-        <div class="header-actions">
-          <span
-            class="note-chip"
-            :class="{ lit: lastNote }"
-            title="最近一次运动点回到原点（经过原点）时奏响的音符"
-          >
-            <i class="note-dot" :style="lastNote ? { background: lastNote.color } : null"></i>
-            <template v-if="lastNote">点{{ lastNote.num }} · {{ lastNote.name }}</template>
-            <template v-else>—</template>
-          </span>
-          <span class="audio-state" :class="audioChipCls" :title="audioChipTitle">
-            <i></i>{{ audioChipText }}
-          </span>
-          <button class="btn ghost sound" :class="{ muted }" @click="toggleMute" :title="muted ? '开启经过音效' : '关闭经过音效'">
-            <svg v-if="muted" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M11 5 6 9H2v6h4l5 4V5z" />
-              <line x1="23" y1="9" x2="17" y2="15" />
-              <line x1="17" y1="9" x2="23" y2="15" />
-            </svg>
-            <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M11 5 6 9H2v6h4l5 4V5z" />
-              <path d="M15.5 8.5a5 5 0 0 1 0 7" />
-              <path d="M18.5 5.5a9 9 0 0 1 0 13" />
-            </svg>
-            {{ muted ? '已静音' : '音效开' }}
-          </button>
-          <button class="btn ghost" @click="testSound" title="立即播放一个 do，用于验证声音并解锁浏览器限制">
-            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M9 18V5l12-2v13" />
-              <circle cx="6" cy="18" r="3" />
-              <circle cx="18" cy="16" r="3" />
-            </svg>
-            试听
-          </button>
-          <button class="btn ghost" @click="reset" title="重置到原点 (R)">
-            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M3 12a9 9 0 1 0 3-6.7" />
-              <path d="M3 4v5h5" />
-            </svg>
-            重置
-          </button>
-          <button class="btn play" :class="{ paused: !playing }" @click="togglePlay" title="播放/暂停 (空格)">
-            <svg v-if="playing" viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
-              <rect x="6" y="5" width="4" height="14" rx="1" />
-              <rect x="14" y="5" width="4" height="14" rx="1" />
-            </svg>
-            <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
-              <path d="M8 5.5v13a1 1 0 0 0 1.5.9l11-6.5a1 1 0 0 0 0-1.8l-11-6.5A1 1 0 0 0 8 5.5Z" />
-            </svg>
-            {{ playing ? '暂停' : '播放' }}
-          </button>
-        </div>
-      </header>
-
-      <!-- 第二行：原底部控制栏（控制项） -->
-      <section class="dock-body">
-        <div class="panel-row controls-row">
-          <div class="pgroup">
-            <span class="plabel">运行方向</span>
-            <div class="seg">
-              <button
-                class="seg-btn"
-                :class="{ on: direction === 'ccw' }"
-                @click="setDirection('ccw')"
-                title="逆时针运行（默认）；快捷键 D"
-              >
-                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" /><path d="M3 3v5h5" /></svg>
-                逆时针
-              </button>
-              <button
-                class="seg-btn"
-                :class="{ on: direction === 'cw' }"
-                @click="setDirection('cw')"
-                title="顺时针运行；快捷键 D"
-              >
-                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" /><path d="M21 3v5h-5" /></svg>
-                顺时针
-              </button>
-            </div>
-            <small>12 个点统一换向；默认逆时针</small>
-          </div>
-
-          <div class="pgroup grow">
-            <span class="plabel">演示倍速</span>
-            <div class="range-row">
-              <input
-                class="range"
-                type="range"
-                min="0.25"
-                max="10"
-                step="0.25"
-                v-model.number="speedScale"
-                title="等比缩放所有点的角速度，不改变“第 n 点 = n 圈/60s”的比例"
-              />
-              <output>×{{ speedScale }}</output>
-            </div>
-            <small>60s 内第 1 点 1 圈、第 2 点 2 圈 … 第 12 点 12 圈</small>
-          </div>
-
-          <div class="pgroup">
-            <span class="plabel">连线显示</span>
-            <label class="tick"><input type="checkbox" v-model="showChord" />各点之间连线</label>
-            <label class="tick"><input type="checkbox" v-model="showSpoke" />各点─原点连线</label>
-            <small>连线均比圆形轨道更淡</small>
-          </div>
-        </div>
-      </section>
-    </div>
+    <SimDock
+      ref="dockRef"
+      :playing="playing"
+      :muted="muted"
+      :show-count="false"
+      :speed="speedScale"
+      @toggle-play="togglePlay"
+      @toggle-mute="toggleMute"
+      @reset="reset"
+      @update:speed="(v) => (speedScale = v)"
+    />
   </div>
 </template>
 
@@ -741,16 +547,13 @@ if (AUDIO_DEBUG) {
   height: 100%;
 }
 
-/* ---------- 顶部总控条：header + panel 合并成一条悬浮玻璃卡片 ---------- */
+/* ---------- 顶部总控条：合并后的整体悬浮玻璃卡片 ---------- */
 .dock {
   position: absolute;
   top: 40px;                     /* 让开顶部居中的页面切换器 */
   left: clamp(8px, 1.6vw, 20px);
   right: clamp(8px, 1.6vw, 20px);
   z-index: 6;
-  display: flex;
-  flex-direction: column;
-  padding: 0 clamp(12px, 2vw, 24px);
   border: 1px solid var(--border);
   border-radius: 16px;
   background: linear-gradient(180deg, rgba(8, 13, 26, 0.92), rgba(15, 23, 42, 0.74));
@@ -758,79 +561,31 @@ if (AUDIO_DEBUG) {
   box-shadow: 0 14px 40px rgba(2, 6, 23, 0.5);
 }
 
-/* 第一行：状态与操作（无标题，整体居中排列） */
-.dock-head {
+/* 合并后的整体控制条：操作按钮 + 参数控件 一行流式排列 */
+.dock-inner {
   display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 14px;
   flex-wrap: wrap;
-  min-height: 44px;
-  padding: 8px 0;
+  flex-direction: row-reverse;
+  align-items: center;
+  gap: clamp(10px, 2vw, 22px);
+  padding: 10px clamp(12px, 2vw, 20px);
 }
-.header-actions {
-  display: flex;
-  gap: 10px;
+.actions {
+  display: inline-flex;
   align-items: center;
+  gap: 8px;
+  flex: none;
+}
+.controls {
+  display: flex;
   flex-wrap: wrap;
-  justify-content: center;
+  align-items: center;
+  gap: clamp(14px, 2.4vw, 36px);
+  flex: 1 1 auto;
   min-width: 0;
 }
-.note-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  padding: 5px 10px;
-  border-radius: 999px;
-  border: 1px solid rgba(148, 163, 184, 0.2);
-  background: rgba(15, 23, 42, 0.55);
-  color: var(--text-2);
-  white-space: nowrap;
-  transition: border-color 0.2s, box-shadow 0.2s;
-}
-.note-chip.lit {
-  border-color: rgba(56, 189, 248, 0.5);
-  box-shadow: 0 0 10px rgba(56, 189, 248, 0.18);
-  color: #e2e8f0;
-}
-.note-dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  flex: none;
-  background: var(--text-3);
-  box-shadow: 0 0 6px currentColor;
-}
-.audio-state {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  padding: 5px 10px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: rgba(15, 23, 42, 0.55);
-  color: var(--text-2);
-  max-width: 230px;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.audio-state i {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--text-3);
-  flex: none;
-}
-.audio-state.ok { border-color: rgba(74, 222, 128, 0.35); }
-.audio-state.ok i { background: #4ade80; box-shadow: 0 0 6px rgba(74, 222, 128, 0.8); }
-.audio-state.ok.muted i { background: #fbbf24; box-shadow: none; }
-.audio-state.warn { border-color: rgba(251, 191, 36, 0.4); color: #fcd34d; }
-.audio-state.warn i { background: #fbbf24; }
-.audio-state.notice { border-color: rgba(56, 189, 248, 0.4); color: #7dd3fc; }
-.audio-state.notice i { background: #38bdf8; }
+
+
 
 .btn {
   display: inline-flex;
@@ -865,42 +620,8 @@ if (AUDIO_DEBUG) {
 }
 .btn.play:hover { filter: brightness(1.08); }
 
-.icon-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 30px;
-  height: 30px;
-  border-radius: 9px;
-  flex: none;
-  border: 1px solid var(--border);
-  background: rgba(30, 41, 59, 0.6);
-  color: var(--text-2);
-  cursor: pointer;
-  transition: all 0.15s;
-}
-.icon-btn:hover {
-  color: #e2e8f0;
-  border-color: #38bdf8;
-  background: rgba(56, 189, 248, 0.12);
-}
-
-/* 第二行：原底部控制栏内容，与第一行上下堆叠 */
-.dock-body {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 8px 0 10px;
-  border-top: 1px dashed rgba(148, 163, 184, 0.2);
-}
-.panel-row {
-  display: flex;
-  align-items: flex-end;
-  gap: clamp(16px, 3vw, 36px);
-  flex-wrap: wrap;
-}
 .pgroup { min-width: 150px; display: flex; flex-direction: column; gap: 6px; }
-.pgroup.grow { flex: 1; min-width: 220px; max-width: 440px; }
+.pgroup.grow { flex: 1; min-width: 200px; max-width: 440px; }
 .plabel {
   font-size: 12px;
   color: var(--text-2);
@@ -908,72 +629,19 @@ if (AUDIO_DEBUG) {
 }
 small { font-size: 11px; color: var(--text-3); line-height: 1.4; }
 
-/* 方向切换 */
-.seg {
-  display: inline-flex;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  overflow: hidden;
-  background: rgba(2, 6, 23, 0.55);
-}
-.seg-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 7px 14px;
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 9px; overflow: hidden; }
+.seg button {
   border: none;
-  background: transparent;
+  background: rgba(15, 23, 42, 0.55);
   color: var(--text-2);
+  padding: 7px 12px;
   font-size: 13px;
   cursor: pointer;
-  transition: all 0.16s;
-  white-space: nowrap;
+  transition: all 0.15s;
 }
-.seg-btn + .seg-btn { border-left: 1px solid var(--border); }
-.seg-btn:hover { color: #e2e8f0; }
-.seg-btn.on {
-  background: linear-gradient(135deg, rgba(14, 165, 233, 0.32), rgba(34, 211, 238, 0.18));
-  color: #e0f2fe;
-  font-weight: 600;
-}
+.seg button + button { border-left: 1px solid var(--border); }
+.seg button.on { background: linear-gradient(135deg, rgba(14,165,233,0.25), rgba(34,211,238,0.25)); color: #e2e8f0; }
 
-.range-row { display: flex; align-items: center; gap: 12px; }
-.range {
-  flex: 1;
-  appearance: none;
-  -webkit-appearance: none;
-  height: 4px;
-  border-radius: 2px;
-  background: linear-gradient(90deg, #0ea5e9, #22d3ee);
-  outline: none;
-  cursor: pointer;
-}
-.range::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: #fff;
-  border: 3px solid var(--accent-2);
-  box-shadow: 0 2px 8px rgba(34, 211, 238, 0.5);
-  cursor: pointer;
-}
-.range::-moz-range-thumb {
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  background: #fff;
-  border: 3px solid var(--accent-2);
-  cursor: pointer;
-}
-output {
-  min-width: 74px;
-  text-align: right;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-1);
-  font-variant-numeric: tabular-nums;
-}
 .tick {
   display: inline-flex;
   align-items: center;
@@ -983,21 +651,44 @@ output {
   cursor: pointer;
   user-select: none;
 }
-.tick input {
-  accent-color: #22d3ee;
-  width: 14px;
-  height: 14px;
+.tick input { accent-color: #22d3ee; width: 14px; height: 14px; cursor: pointer; }
+
+/* 倍速下拉 */
+.speed-select {
+  appearance: none;
+  -webkit-appearance: none;
+  height: 34px;
+  width: 76px;
+  padding: 0 26px 0 10px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background-color: rgba(2, 6, 23, 0.7);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  color: var(--text-1);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
   cursor: pointer;
+  outline: none;
+  transition: border 0.15s, box-shadow 0.15s;
+}
+.speed-select:focus {
+  border-color: #38bdf8;
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.18);
+}
+.pgroup.inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.pgroup.inline .plabel {
+  white-space: nowrap;
+}
+.pgroup.inline small {
+  display: none;
 }
 
-@media (max-width: 1440px) {
-  .dock-head .note-chip { display: none; }
-}
-@media (max-width: 1280px) {
-  .dock-head .audio-state { display: none; }
-}
-@media (max-width: 1180px) {
-  .dock-head .btn.sound { display: none; }
-}
-
+@media (max-width: 1080px) { .btn.sound { display: none; } }
 </style>
