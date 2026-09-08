@@ -6,8 +6,9 @@ import { onMounted, onBeforeUnmount, ref, watch, computed } from 'vue'
  *  1. 水平直线贯穿整个画布
  *  2. 中心原点，半径略大于直线宽度
  *  3. 原点向左每隔一段距离等距排列“点”
- *  4. 点的数量由用户输入控制
- *  5. 相邻点间距存在 [SPACING_MIN, SPACING_MAX] 约束
+ *  4. 点的数量由用户输入控制：窗口尺寸变化时数量保持不变，仅手动修改才更新
+ *  5. 相邻点间距为固定值 FIXED_SPACING，不可由用户调整；构图随窗口整体等比缩放适配
+ *  5b.顶部信息/控制条与底部参数条悬浮于画布之上且可折叠/隐藏，不占用主运行区域
  *  6. 以“点到原点的距离”为半径，画上方半圆弧路径（颜色比直线淡）
  *  7. 播放按钮：点击后点开始运动
  *  8. 各层按“周期”定速：最内层点每 900s 往返 127 次，最外层往返 100 次，
@@ -20,10 +21,8 @@ import { onMounted, onBeforeUnmount, ref, watch, computed } from 'vue'
  * ========================================================= */
 
 /* ---------- 常量 ---------- */
-const SPACING_MIN = 20            // 相邻点间距 slider 手动下限 px
-const SPACING_MAX = 140           // 相邻点间距 slider 手动上限 px
-const ABS_MIN_SPACING = 10        // 点较多时自动收缩间距的绝对下限 px
-const MAX_DOTS = 40               // 数量的绝对 UI 上限
+const FIXED_SPACING = 64          // 点间距固定值 px：不可由用户调整；构图随窗口整体等比缩放适配
+const MAX_DOTS = 40               // 数量的 UI 硬上限（仅约束手动输入，不随窗口尺寸自动回落）
 const LINE_WIDTH = 3              // 主直线宽度 px
 const ORIGIN_R = 7                // 原点半径（> 直线宽度）
 const DOT_R = 6                   // 运动点半径
@@ -42,12 +41,13 @@ const MAX_FRAME = 0.05            // 单帧最大 dt 秒（防止后台切回跳
 const NOTE_FREQS = [261.63, 293.66, 329.63, 349.23, 392.0, 440.0, 493.88]
 
 /* ---------- 交互状态（响应式） ---------- */
-const countInput = ref(28)         // 用户输入的点数量（默认 28，可自由增减）
-const spacingVal = ref(64)         // 用户期望的间距
+const countInput = ref(28)         // 用户输入的点数量（默认 28；仅手动修改时变化，不随窗口尺寸变化）
 const speedScale = ref(1)          // 演示倍速：整体缩放周期节奏，不影响内外层比例
-const playing = ref(false)        // 是否播放
-const muted = ref(false)          // 是否静音（默认有声）
-const availR = ref(0)             // 当前画布可用半径（自动适配窗口）
+const playing = ref(false)         // 是否播放
+const muted = ref(false)           // 是否静音（默认有声）
+const viewScale = ref(1)           // 整体视图缩放（0~1）：把“固定间距×数量”的构图等比适配进可视区
+const headerOpen = ref(true)       // 顶部信息/控制条是否展开
+const panelOpen = ref(true)        // 底部参数条是否展开
 
 // 音频解锁状态：idle | starting | ready | blocked | unsupported
 const audioState = ref('idle')
@@ -64,6 +64,8 @@ const sim = {
   dpr: 1,
   cx: 0,
   cy: 0,
+  availR: 0,       // 当前可视区能容纳的最大半径（随窗口 / 悬浮条状态变化）
+  scale: 1,        // 整体视图缩放：构图不超界时为 1，超出则等比缩小以完整容纳
   dots: [],        // 每个运动点: { d, L, pos, dir, bounce }，数组序=距原点由近及远
   ripples: [],     // 触线反弹时的冲击波纹
 }
@@ -86,36 +88,18 @@ let rafId = 0
 let lastTs = 0
 let resizeObserver = null
 
-/* ---------- 约束推导（供 UI 展示） ---------- */
-// 数量上限 = 可用半径内按绝对最小间距能摆放的最大点数（另设 UI 硬顶）
-const maxCount = computed(() => {
-  if (availR.value <= 0) return MAX_DOTS
-  return Math.min(MAX_DOTS, Math.max(1, Math.floor(availR.value / ABS_MIN_SPACING)))
-})
+/* ---------- 数量约束与画布几何（间距固定、数量不受窗口影响） ---------- */
+// 点数仅受 UI 硬上限约束：只有用户手动修改数量时 sim.dots 才会重建；
+// 窗口尺寸变化不回落数量、不压缩间距。若“数量×固定间距”超出可视区，
+// 则整幅构图等比缩小（viewScale）以完整容纳，实际外缘 = radiusOuter。
+const effCount = computed(() =>
+  Math.min(Math.max(Math.round(Number(countInput.value) || 1), 1), MAX_DOTS)
+)
 
-const effCount = computed(() => {
-  const n = Math.round(Number(countInput.value) || 1)
-  return Math.min(Math.max(n, 1), maxCount.value)
-})
-
-const effSpacing = computed(() => {
-  const n = effCount.value
-  const cap = availR.value > 0 ? availR.value / n : SPACING_MAX
-  // 点少时尊重用户手动间距；点多放不下时自动压缩到空间允许值（下限 ABS_MIN_SPACING）
-  return Math.min(Math.max(spacingVal.value, SPACING_MIN), Math.min(SPACING_MAX, Math.max(cap, ABS_MIN_SPACING)))
-})
-
-const spacingLabel = computed(() => Math.round(effSpacing.value))
-const outerLabel = computed(() => Math.round(effSpacing.value * effCount.value))
-
-const spacingHint = computed(() => {
-  const manual = `手动范围 ${SPACING_MIN} ~ ${SPACING_MAX}px`
-  const auto =
-    effCount.value > 0 && availR.value / effCount.value < SPACING_MIN
-      ? `；当前 ${effCount.value} 个点已超出手动下限，已自动压缩至 ${Math.max(Math.round(availR.value / effCount.value), ABS_MIN_SPACING)}px`
-      : ''
-  return `${manual}${auto}（空间不足时自动收缩，保证弧线不越界）`
-})
+// 最外层半径：逻辑值（effCount × FIXED_SPACING）经视图缩放后的实际显示像素
+const radiusOuter = computed(() =>
+  Math.round(effCount.value * FIXED_SPACING * viewScale.value)
+)
 
 /* ---------- 画布几何与点列重建 ---------- */
 function layout() {
@@ -135,23 +119,32 @@ function layout() {
   sim.cx = w / 2
   sim.cy = h * LINE_Y_RATIO
 
-  // 可用半径 = 水平可用一半（左右各留 60px）与 竖直可用高度（弧顶避开左上角徽章）的较小值
-  availR.value = Math.max(50, Math.min(w / 2 - 60, sim.cy - 64))
+  // 顶部悬浮条展开时预留其遮挡高度（仅单行标题+状态栏）；收起后运行区更大 → 可用半径随之增大
+  const topPad = headerOpen.value ? 96 : 52
+  sim.availR = Math.max(40, Math.min(w / 2 - 48, sim.cy - topPad))
 
-  // 数量自动回落到当前画布可容纳范围
-  const c = Math.min(Math.max(1, Math.round(Number(countInput.value) || 1)), maxCount.value)
-  if (c !== countInput.value) countInput.value = c
+  // 注意：不再按窗口回落/压缩点数——数量与间距都保持用户设定
   syncDots()
+  applyViewScale()
+}
+
+// 若构图总宽（点数 × 固定间距）超出当前可视半径，整体等比缩小；否则保持 1:1
+function applyViewScale() {
+  const n = sim.dots.length
+  const logical = n * FIXED_SPACING
+  sim.scale = logical > 0 ? Math.min(1, sim.availR / logical) : 1
+  viewScale.value = sim.scale
 }
 
 function syncDots() {
-  const dists = Array.from({ length: effCount.value }, (_, i) => (i + 1) * effSpacing.value)
+  const n = effCount.value
+  const dists = Array.from({ length: n }, (_, i) => (i + 1) * FIXED_SPACING)
   const old = sim.dots
   sim.dots = dists.map((d, i) => {
-    const L = Math.PI * d // 半圆弧长
+    const L = Math.PI * d // 半圆弧长（逻辑值，绘制时乘视图缩放系数）
     const prev = old[i]
     if (prev && prev.L > 0) {
-      // 尽量保持原来在弧上的相对进度（改变数量/间距时不突兀）
+      // 尽量保持原来在弧上的相对进度（手动改数量时位置不突兀）
       const frac = Math.min(Math.max(prev.pos / prev.L, 0), 1)
       return { d, L, pos: frac * L, dir: prev.dir, bounce: -1 }
     }
@@ -161,8 +154,7 @@ function syncDots() {
 }
 
 function setCount(value) {
-  const n = Math.round(Number(value) || 1)
-  countInput.value = Math.min(Math.max(n, 1), maxCount.value)
+  countInput.value = Math.min(Math.max(Math.round(Number(value) || 1), 1), MAX_DOTS)
 }
 function stepCount(delta) {
   setCount((Number(countInput.value) || 1) + delta)
@@ -179,18 +171,6 @@ const timeVirt = ref('00:00.0')
 
 // —— 时间定位（seek）状态 ——
 const seekText = ref('00:00') // 输入框文本，格式 mm:ss 或纯秒数
-const quickSel = ref('')      // 快速选择下拉（用于复位选中态）
-
-const TIME_PRESETS = [
-  { label: '起点 00:00', value: 0 },
-  { label: '00:15', value: 15 },
-  { label: '00:30', value: 30 },
-  { label: '01:00', value: 60 },
-  { label: '03:00', value: 180 },
-  { label: '07:30', value: 450 },
-  { label: '12:00', value: 720 },
-  { label: '15:00（900s）', value: 900 },
-]
 
 function fmtClock(s) {
   const m = Math.floor(s / 60)
@@ -276,14 +256,6 @@ function applySeekInput() {
 function seekLive() {
   const secs = parseSeekSeconds(seekText.value)
   if (secs !== null && secs >= 0 && secs <= CYCLE_PERIOD) seekEq(secs, true)
-}
-
-function onPresetJump() {
-  const v = Number(quickSel.value)
-  if (!Number.isFinite(v)) return
-  quickSel.value = ''
-  seekEq(v)
-  flashNotice(`已定位到 ${fmtMMSS(v)}`, 1600)
 }
 
 function nudgeSeek(delta) {
@@ -617,7 +589,7 @@ const audioChipTitle = computed(() => {
 function impactAtEnd(p, index) {
   // 触线反弹：标记冲击时刻（用于绘制弹性压缩/回弹）
   p.bounce = 0
-  const sideX = p.pos <= 0 ? sim.cx + p.d : sim.cx - p.d // 触地点（直线另一端）
+  const sideX = p.pos <= 0 ? sim.cx + p.d * sim.scale : sim.cx - p.d * sim.scale // 触地点（直线另一端）
   sim.ripples.push({ x: sideX, y: sim.cy, age: 0 })
   if (sim.ripples.length > 24) sim.ripples.shift()
   audioStats.collisions++
@@ -728,8 +700,8 @@ function drawArcPaths(ctx) {
   ctx.lineCap = 'round'
   for (const p of sim.dots) {
     ctx.beginPath()
-    // canvas 角度 π→2π 即为直线以上的半圆（左端→顶点→右端）
-    ctx.arc(sim.cx, sim.cy, p.d, Math.PI, Math.PI * 2, false)
+    // canvas 角度 π→2π 即为直线以上的半圆（左端→顶点→右端）；半径按视图缩放
+    ctx.arc(sim.cx, sim.cy, p.d * sim.scale, Math.PI, Math.PI * 2, false)
     ctx.strokeStyle = `rgba(103,232,249,${ARC_ALPHA})` // 颜色显著淡于主直线
     ctx.lineWidth = 2
     ctx.stroke()
@@ -745,8 +717,9 @@ function drawConnectors(ctx) {
   ctx.strokeStyle = `rgba(148,210,250,${CONNECT_ALPHA})`
   for (const p of sim.dots) {
     const a = p.pos / p.d
-    const x = sim.cx + p.d * Math.cos(a)
-    const y = sim.cy - p.d * Math.sin(a)
+    const r = p.d * sim.scale
+    const x = sim.cx + r * Math.cos(a)
+    const y = sim.cy - r * Math.sin(a)
     ctx.beginPath()
     ctx.moveTo(sim.cx, sim.cy)
     ctx.lineTo(x, y)
@@ -771,8 +744,9 @@ function drawRipples(ctx) {
 function drawDots(ctx) {
   for (const p of sim.dots) {
     const a = p.pos / p.d
-    const x = sim.cx + p.d * Math.cos(a)
-    const y = sim.cy - p.d * Math.sin(a)
+    const r = p.d * sim.scale
+    const x = sim.cx + r * Math.cos(a)
+    const y = sim.cy - r * Math.sin(a)
 
     // 弹性反弹形变：触线瞬间横向压扁(挤压)，随后竖直过冲(回弹)并衰减
     let rx = DOT_R
@@ -873,8 +847,13 @@ function onKeydown(e) {
   }
 }
 
-watch([countInput, spacingVal], () => {
+watch(countInput, () => {
   syncDots()
+  applyViewScale()
+})
+// 顶部/底部悬浮条收起或展开后，可视半径变化 → 重新做等比适配
+watch([headerOpen, panelOpen], () => {
+  layout()
 })
 
 onMounted(() => {
@@ -920,17 +899,20 @@ if (AUDIO_DEBUG) {
 
 <template>
   <div class="sim-root">
-    <header class="sim-header">
-      <div>
-        <h1>半圆往返 · 弹性反弹 · 音阶碰撞</h1>
-        <p class="sub">默认 28 个点，沿各自上方半圆路径往返，触线反弹并发声；最内层每 900s 往返 127 次、最外层 100 次（内快外慢）；音高按距原点由近及远为 Do Re Mi Fa Sol La Si，超 7 点升八度循环；碰撞音随触线侧分左右声道（左端点→左声道，右端点→右声道）</p>
-      </div>
+    <!-- 主运行区：占满整个视口（画布全屏最大化，信息条仅悬浮其上） -->
+    <div class="stage" ref="stageRef">
+      <canvas ref="canvasRef" class="sim-canvas"></canvas>
+    </div>
+
+    <!-- ================= 顶部标题 + 操作/状态栏（悬浮 + 可折叠，单行布局） ================= -->
+    <header v-if="headerOpen" class="sim-header">
+      <h1>半圆往返 · 弹性反弹 · 音阶碰撞</h1>
       <div class="header-actions">
         <span class="clock-chip" title="播放自开始/重置以来的实际流逝时间（暂停期间不计）">
           <b>运行</b><em>{{ timeReal }}</em>
         </span>
         <span class="clock-chip" title="等效周期时间 = 实际时间 × 倍速。×1 时到 15:00 即对应规则中的 900s：最内层往返 127 次、最外层 100 次；倍速越高到点越快">
-          <b>等效</b><em>{{ timeVirt }}</em> / 15:00
+          <b>等效</b><em>{{ timeVirt }}</em><span class="clock-den">/15:00</span>
         </span>
         <span class="seek-chip">
           <b class="seek-label">定位</b>
@@ -945,10 +927,6 @@ if (AUDIO_DEBUG) {
             @keydown.enter.prevent="applySeekInput"
             @keydown.esc="seekText = fmtMMSS(Math.round(virtElapsed))"
           />
-          <select v-model="quickSel" class="seek-select" title="快速选择预设时刻" @change="onPresetJump">
-            <option value="" disabled>快捷…</option>
-            <option v-for="p in TIME_PRESETS" :key="p.value" :value="p.value">{{ p.label }}</option>
-          </select>
           <button class="seek-btn" title="后退 10 秒" @click="nudgeSeek(-10)">−10s</button>
           <button class="seek-btn" title="前进 10 秒" @click="nudgeSeek(10)">+10s</button>
           <button class="seek-btn go" title="跳转到输入的时间点" @click="applySeekInput">跳转</button>
@@ -999,124 +977,138 @@ if (AUDIO_DEBUG) {
           </svg>
           {{ playing ? '暂停' : '播放' }}
         </button>
+        <button class="icon-btn collapse" title="收起顶部信息栏" @click="headerOpen = false">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6" /></svg>
+        </button>
       </div>
     </header>
 
-    <div class="stage" ref="stageRef">
-      <canvas ref="canvasRef" class="sim-canvas"></canvas>
-
-      <div class="stage-badges">
-        <span class="badge" :class="{ running: playing }">
-          <i></i>{{ playing ? '运动进行中' : '已暂停' }}
-        </span>
-        <span class="badge">点数 {{ effCount }} / {{ maxCount }}</span>
-        <span class="badge">实际间距 {{ spacingLabel }}px</span>
-        <span class="badge">最远半径 {{ outerLabel }}px</span>
-      </div>
-
-      <div class="legend">
-        <span class="lg"><i class="sw line"></i>基准直线</span>
-        <span class="lg"><i class="sw arc"></i>半圆路径</span>
-        <span class="lg"><i class="sw conn"></i>到原点连线</span>
-        <span class="lg"><i class="sw origin"></i>原点</span>
-        <span class="lg"><i class="sw dot"></i>运动点</span>
-        <span class="lg"><i class="sw stereo"></i>碰左端→左声道 · 碰右端→右声道</span>
-      </div>
+    <div v-else class="mini-top">
+      <button class="icon-btn" title="展开顶部信息栏" @click="headerOpen = true">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
+      </button>
+      <span class="mini-state" :class="{ running: playing }"><i></i>{{ playing ? '运行中' : '已暂停' }}</span>
+      <span class="mini-clock"><b>运行</b>{{ timeReal }}</span>
+      <span class="mini-clock"><b>等效</b>{{ timeVirt }} / 15:00</span>
+      <span class="mini-note">点数 {{ effCount }} · 最远半径 {{ radiusOuter }}px</span>
+      <button class="btn ghost mini-reset" @click="reset" title="重置 (R)">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7" /><path d="M3 4v5h5" /></svg>
+        重置
+      </button>
+      <button class="mini-play" :class="{ paused: !playing }" @click="togglePlay" title="播放/暂停 (空格)">
+        <svg v-if="playing" viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
+          <rect x="6" y="5" width="4" height="14" rx="1" /><rect x="14" y="5" width="4" height="14" rx="1" />
+        </svg>
+        <svg v-else viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
+          <path d="M8 5.5v13a1 1 0 0 0 1.5.9l11-6.5a1 1 0 0 0 0-1.8l-11-6.5A1 1 0 0 0 8 5.5Z" />
+        </svg>
+        {{ playing ? '暂停' : '播放' }}
+      </button>
     </div>
 
-    <section class="panel">
-      <div class="pgroup">
-        <span class="plabel">点的数量</span>
-        <div class="stepper">
-          <button class="step" :disabled="effCount <= 1" @click="stepCount(-1)">−</button>
-          <input
-            class="num"
-            type="number"
-            min="1"
-            :max="maxCount"
-            v-model.number="countInput"
-            @change="setCount(countInput)"
-          />
-          <button class="step" :disabled="effCount >= maxCount" @click="stepCount(1)">+</button>
+    <!-- ================= 底部参数条：悬浮 + 可折叠 ================= -->
+    <section v-if="panelOpen" class="panel">
+      <div class="panel-row">
+        <div class="pgroup">
+          <span class="plabel">点的数量</span>
+          <div class="stepper">
+            <button class="step" :disabled="effCount <= 1" @click="stepCount(-1)">−</button>
+            <input
+              class="num"
+              type="number"
+              min="1"
+              :max="MAX_DOTS"
+              v-model.number="countInput"
+              @change="setCount(countInput)"
+            />
+            <button class="step" :disabled="effCount >= MAX_DOTS" @click="stepCount(1)">+</button>
+          </div>
+          <small>1 ~ {{ MAX_DOTS }}：仅手动修改才变化，窗口尺寸改变不影响数量</small>
         </div>
-        <small>1 ~ {{ maxCount }}</small>
-      </div>
 
-      <div class="pgroup grow">
-        <span class="plabel">点间距</span>
-        <div class="range-row">
-          <input
-            class="range"
-            type="range"
-            :min="SPACING_MIN"
-            :max="SPACING_MAX"
-            step="1"
-            v-model.number="spacingVal"
-          />
-          <output>{{ spacingLabel }}px</output>
+        <div class="pgroup grow">
+          <span class="plabel">演示倍速</span>
+          <div class="range-row">
+            <input
+              class="range"
+              type="range"
+              min="0.25"
+              max="10"
+              step="0.25"
+              v-model.number="speedScale"
+              title="整体缩放运动节奏，不改变内外层的 127:100 周期比例；最高 ×10"
+            />
+            <output>×{{ speedScale }}</output>
+          </div>
+          <small>最内层每 900s 往返 127 次 → 最外层 100 次（按层线性过渡，内快外慢）</small>
         </div>
-        <small>{{ spacingHint }}</small>
-      </div>
-
-      <div class="pgroup grow">
-        <span class="plabel">演示倍速</span>
-        <div class="range-row">
-          <input
-            class="range"
-            type="range"
-            min="0.25"
-            max="10"
-            step="0.25"
-            v-model.number="speedScale"
-            title="整体缩放运动节奏，不改变内外层的 127:100 周期比例；最高 ×10"
-          />
-          <output>×{{ speedScale }}</output>
-        </div>
-        <small>周期规律：最内层每 900s 往返 127 次 → 最外层 100 次（按层线性过渡，内快外慢）；倍速整体缩放节奏</small>
+        <button class="icon-btn collapse" title="收起底部参数栏" @click="panelOpen = false">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
+        </button>
       </div>
     </section>
+
+    <button v-else class="panel-fab" title="展开底部参数栏" @click="panelOpen = true">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1Z" /></svg>
+      参数
+    </button>
   </div>
 </template>
 
 <style scoped>
 .sim-root {
+  position: relative;
   height: 100dvh;
-  display: flex;
-  flex-direction: column;
   overflow: hidden;
 }
 
-/* ---------- header ---------- */
+/* ---------- 主运行区：占满整个视口（悬浮条不参与布局，画布始终全屏） ---------- */
+.stage {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+.sim-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* ---------- header（悬浮 + 半透明毛玻璃，不占用布局空间） ---------- */
 .sim-header {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 6;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  flex-wrap: wrap;
-  padding: 14px clamp(16px, 4vw, 40px);
+  gap: 14px;
+  flex-wrap: nowrap;
+  padding: 8px clamp(16px, 3vw, 32px);
   border-bottom: 1px solid var(--border);
-  background: linear-gradient(180deg, rgba(15, 23, 42, 0.65), rgba(15, 23, 42, 0.1));
+  background: linear-gradient(180deg, rgba(8, 13, 26, 0.85), rgba(15, 23, 42, 0.5) 75%, rgba(15, 23, 42, 0));
+  backdrop-filter: blur(10px);
 }
 .sim-header h1 {
-  font-size: 18px;
+  font-size: 17px;
   font-weight: 700;
   letter-spacing: 0.3px;
+  white-space: nowrap;
+  flex: none;
   background: linear-gradient(90deg, #e0f2fe, #7dd3fc 60%, #22d3ee);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
 }
-.sim-header .sub {
-  margin-top: 3px;
-  font-size: 12px;
-  color: var(--text-3);
-}
 .header-actions {
   display: flex;
   gap: 10px;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   justify-content: flex-end;
+  min-width: 0;
 }
 .clock-chip {
   display: inline-flex;
@@ -1139,6 +1131,12 @@ if (AUDIO_DEBUG) {
   color: #7dd3fc;
   font-style: normal;
   font-weight: 600;
+}
+.clock-den {
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 500;
+  margin-left: 1px;
 }
 .seek-chip {
   display: inline-flex;
@@ -1175,16 +1173,6 @@ if (AUDIO_DEBUG) {
 .seek-input::placeholder {
   color: var(--text-3);
   opacity: 0.6;
-}
-.seek-select {
-  padding: 3px 4px;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: rgba(2, 6, 23, 0.72);
-  color: var(--text-1);
-  font-size: 12px;
-  outline: none;
-  max-width: 96px;
 }
 .seek-btn {
   padding: 3px 7px;
@@ -1299,99 +1287,171 @@ if (AUDIO_DEBUG) {
   filter: brightness(1.08);
 }
 
-/* ---------- stage ---------- */
-.stage {
-  position: relative;
-  flex: 1;
-  min-height: 260px;
-  overflow: hidden;
+/* ---------- 通用图标按钮 ---------- */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  flex: none;
+  border: 1px solid var(--border);
+  background: rgba(30, 41, 59, 0.6);
+  color: var(--text-2);
+  cursor: pointer;
+  transition: all 0.15s;
 }
-.sim-canvas {
-  display: block;
-  width: 100%;
-  height: 100%;
+.icon-btn:hover {
+  color: #e2e8f0;
+  border-color: #38bdf8;
+  background: rgba(56, 189, 248, 0.12);
 }
-.stage-badges {
+
+/* ---------- 顶部信息栏收起后的极简状态条 ---------- */
+.mini-top {
   position: absolute;
-  top: 14px;
-  left: clamp(14px, 3vw, 28px);
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 6;
   display: flex;
-  gap: 8px;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
   flex-wrap: wrap;
-  pointer-events: none;
+  background: linear-gradient(180deg, rgba(8, 13, 26, 0.9), rgba(15, 23, 42, 0.6));
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(10px);
 }
-.badge {
+.mini-state {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   font-size: 12px;
   color: var(--text-2);
-  background: rgba(15, 23, 42, 0.55);
-  border: 1px solid var(--border);
-  backdrop-filter: blur(6px);
-  padding: 5px 10px;
-  border-radius: 999px;
+  white-space: nowrap;
 }
-.badge i {
+.mini-state i {
   width: 7px;
   height: 7px;
   border-radius: 50%;
   background: var(--text-3);
 }
-.badge.running i {
+.mini-state.running i {
   background: #4ade80;
-  box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.6);
   animation: pulse 1.4s infinite;
 }
+.mini-clock {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 12px;
+  color: #7dd3fc;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  border: 1px solid rgba(56, 189, 248, 0.28);
+  background: rgba(15, 23, 42, 0.55);
+  padding: 4px 10px;
+  border-radius: 999px;
+}
+.mini-clock b {
+  color: var(--text-3);
+  font-weight: 500;
+}
+.mini-note {
+  flex: 1;
+  min-width: 220px;
+  text-align: right;
+  font-size: 12px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mini-play {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: none;
+  background: linear-gradient(135deg, #0ea5e9, #22d3ee);
+  color: #03131f;
+  font-weight: 700;
+  border-radius: 999px;
+  padding: 7px 14px;
+  font-size: 13px;
+  min-width: 86px;
+  cursor: pointer;
+}
+.mini-play:active {
+  transform: scale(0.96);
+}
+.mini-reset {
+  padding: 6px 12px;
+  border-radius: 999px;
+}
+
 @keyframes pulse {
   0% { box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.55); }
   70% { box-shadow: 0 0 0 7px rgba(74, 222, 128, 0); }
   100% { box-shadow: 0 0 0 0 rgba(74, 222, 128, 0); }
 }
 
-.legend {
-  position: absolute;
-  right: clamp(14px, 3vw, 28px);
-  bottom: 12px;
-  display: flex;
-  gap: 14px;
-  padding: 8px 14px;
-  border-radius: 10px;
-  background: rgba(15, 23, 42, 0.5);
-  border: 1px solid var(--border);
-  backdrop-filter: blur(6px);
-  font-size: 12px;
-  color: var(--text-2);
-  flex-wrap: wrap;
-}
-.lg {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-}
-.sw {
-  display: inline-block;
-  width: 22px;
-  height: 4px;
-  border-radius: 2px;
-}
-.sw.line { background: linear-gradient(90deg, rgba(125, 211, 252, 0.4), #7dd3fc); }
-.sw.arc { background: #67e8f9; opacity: 0.4; border-radius: 4px 4px 0 0; height: 10px; clip-path: none; }
-.sw.conn { background: #94d2fa; opacity: 0.16; height: 2px; width: 26px; }
-.sw.origin { background: radial-gradient(circle at 30% 30%, #fff7ed, #f59e0b); height: 10px; width: 10px; border-radius: 50%; }
-.sw.dot { background: radial-gradient(circle at 30% 30%, #fff, #0ea5e9); height: 10px; width: 10px; border-radius: 50%; }
-.sw.stereo { background: linear-gradient(90deg, #38bdf8 0 50%, #f472b6 50% 100%); height: 10px; width: 10px; border-radius: 3px; }
-
-/* ---------- panel ---------- */
+/* ---------- panel（悬浮于底部，不占布局空间；可折叠） ---------- */
 .panel {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px clamp(14px, 2.5vw, 28px) 10px;
+  background: linear-gradient(0deg, rgba(8, 13, 26, 0.88), rgba(15, 23, 42, 0.55) 85%, rgba(15, 23, 42, 0));
+  border-top: 1px solid var(--border);
+  backdrop-filter: blur(12px);
+}
+.panel-row {
   display: flex;
   align-items: flex-end;
   gap: clamp(16px, 3vw, 34px);
   flex-wrap: wrap;
-  padding: 12px clamp(16px, 4vw, 40px) 14px;
-  background: var(--panel);
-  border-top: 1px solid var(--border);
-  backdrop-filter: blur(14px);
+  padding-right: 34px; /* 给右上角“收起”按钮留位 */
+}
+.panel-row .collapse {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  margin-left: 0;
+}
+.panel-fab {
+  position: absolute;
+  bottom: 14px;
+  right: clamp(14px, 3vw, 30px);
+  z-index: 7;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid rgba(56, 189, 248, 0.4);
+  background: rgba(15, 23, 42, 0.78);
+  color: #7dd3fc;
+  border-radius: 999px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+  box-shadow: 0 4px 18px rgba(2, 6, 23, 0.4);
+  transition: all 0.15s;
+}
+.panel-fab:hover {
+  background: rgba(56, 189, 248, 0.16);
+  border-color: #38bdf8;
+}
+.panel-fab svg {
+  flex: none;
 }
 .pgroup {
   min-width: 150px;
@@ -1493,5 +1553,28 @@ output {
   font-weight: 600;
   color: var(--text-1);
   font-variant-numeric: tabular-nums;
+}
+
+/* —— 顶部状态栏与标题保持同一行：窄屏时逐步隐藏次要控件 —— */
+@media (max-width: 1480px) {
+  .sim-header .seek-btn {
+    display: none; /* 隐藏 ±10s，保留 mm:ss 输入 + 跳转 */
+  }
+}
+@media (max-width: 1320px) {
+  .sim-header .audio-state {
+    display: none;
+  }
+}
+@media (max-width: 1240px) {
+  .sim-header .btn.sound {
+    display: none; /* 隐藏静音开关，仍可用“试听”体验声音 */
+  }
+}
+@media (max-width: 1080px) {
+  .sim-header .seek-label,
+  .sim-header .clock-chip {
+    display: none;
+  }
 }
 </style>
