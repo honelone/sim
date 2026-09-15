@@ -5,6 +5,7 @@
  *   - 音频上下文由“用户手势”解锁（浏览器自动播放策略），会自动重试/补发
  *   - 音高（freq）由 scaleTones.js 的 assembleScale 预先算好后传入，本引擎只负责合成与播放
  *   - 每个音 = 基音(指数衰减) + 八度/高频泛音 + 一记“撞击瞬态”噪声，并支持左右声道定位
+ *   - 所有发声汇总到 voiceBus：干声直连总线，同时按比例送入卷积混响支路（合成 IR），得到空间/立体感
  */
 import { assembleScale } from './scaleTones.js'
 
@@ -13,8 +14,19 @@ export class SoundEngine {
     this.masterVolume = opts.masterVolume ?? 0.55
     this.debug = opts.debug ?? false
 
+    // 空间感（混响）参数：wet 比例越高越“远”，时间越长空间越大
+    this.reverbEnabled = opts.reverb !== false
+    this.reverbMix = opts.reverbMix ?? 0.26
+    this.reverbTime = opts.reverbTime ?? 1.7
+
     this.audioCtx = null
     this.masterGain = null
+    this.voiceBus = null      // 所有发声点汇总到总线，再分出干声与混响送出
+    this.reverbSend = null
+    this.reverbPreDelay = null
+    this.reverbDamp = null
+    this.convolver = null
+    this.reverbReturn = null
     this.noiseBuffer = null
     this.resumePromise = null
     this.retryTimer = 0
@@ -41,6 +53,12 @@ export class SoundEngine {
     if (this.audioCtx) {
       this.audioCtx = null
       this.masterGain = null
+      this.voiceBus = null
+      this.reverbSend = null
+      this.reverbPreDelay = null
+      this.reverbDamp = null
+      this.convolver = null
+      this.reverbReturn = null
       this.noiseBuffer = null
     }
     const AC = window.AudioContext || window['webkitAudioContext']
@@ -61,6 +79,12 @@ export class SoundEngine {
       this.masterGain.connect(comp)
       comp.connect(this.audioCtx.destination)
 
+      // 发声总线：干声直连 masterGain，同时按比例送入混响支路
+      this.voiceBus = this.audioCtx.createGain()
+      this.voiceBus.gain.value = 1
+      this.voiceBus.connect(this.masterGain)
+      this._buildReverb()
+
       // 预生成 60ms 白噪声缓冲，供“撞击瞬态”复用
       const len = Math.floor(this.audioCtx.sampleRate * 0.06)
       this.noiseBuffer = this.audioCtx.createBuffer(1, len, this.audioCtx.sampleRate)
@@ -74,8 +98,82 @@ export class SoundEngine {
       try { this.audioCtx && this.audioCtx.close() } catch (e) {}
       this.audioCtx = null
       this.masterGain = null
+      this.voiceBus = null
+      this.reverbSend = null
+      this.reverbPreDelay = null
+      this.reverbDamp = null
+      this.convolver = null
+      this.reverbReturn = null
       this.noiseBuffer = null
       return false
+    }
+  }
+
+  /* ---------- 混响支路 ---------- */
+  // 合成一段立体声脉冲响应（IR）：指数衰减噪声 + 高频阻尼，听起来像中小房间的自然回声
+  _buildImpulseResponse(seconds, decay = 2.6) {
+    const rate = this.audioCtx.sampleRate
+    const len = Math.max(1, Math.floor(rate * seconds))
+    const buf = this.audioCtx.createBuffer(2, len, rate)
+    const fadeIn = Math.max(1, rate * 0.004) // 头部淡入，避免“咔哒”爆音
+    for (let ch = 0; ch < 2; ch++) {
+      const data = buf.getChannelData(ch)
+      let lp = 0
+      for (let i = 0; i < len; i++) {
+        const t = i / len
+        const env = Math.pow(1 - t, decay)
+        const n = Math.random() * 2 - 1
+        lp += (n - lp) * 0.32 // 一阶低通：模拟空气对高频的吸收
+        data[i] = lp * env * Math.min(1, i / fadeIn)
+      }
+    }
+    return buf
+  }
+
+  _buildReverb() {
+    if (!this.reverbEnabled || !this.audioCtx.createConvolver) return false
+    try {
+      this.convolver = this.audioCtx.createConvolver()
+      this.convolver.normalize = true // 由浏览器按能量归一，湿声音量不随混响时长漂移
+      this.convolver.buffer = this._buildImpulseResponse(this.reverbTime)
+
+      this.reverbSend = this.audioCtx.createGain()
+      this.reverbSend.gain.value = 1
+
+      // 预延迟：直达声与回声拉开一点距离，空间定位更清晰
+      this.reverbPreDelay = this.audioCtx.createDelay(0.2)
+      this.reverbPreDelay.delayTime.value = 0.018
+
+      // 阻尼低通：只让中低频进入混响，避免高频糊成一片
+      this.reverbDamp = this.audioCtx.createBiquadFilter()
+      this.reverbDamp.type = 'lowpass'
+      this.reverbDamp.frequency.value = 4200
+      this.reverbDamp.Q.value = 0.7071
+
+      this.reverbReturn = this.audioCtx.createGain()
+      this.reverbReturn.gain.value = this.reverbMix
+
+      this.voiceBus.connect(this.reverbSend)
+      this.reverbSend.connect(this.reverbPreDelay)
+      this.reverbPreDelay.connect(this.reverbDamp)
+      this.reverbDamp.connect(this.convolver)
+      this.convolver.connect(this.reverbReturn)
+      this.reverbReturn.connect(this.masterGain)
+      return true
+    } catch (err) {
+      console.warn('混响初始化失败，退回干声', err)
+      this.convolver = null
+      this.reverbSend = null
+      this.reverbReturn = null
+      return false
+    }
+  }
+
+  // 运行时调节湿声比例（0 = 全干声）
+  setReverbMix(v) {
+    this.reverbMix = Math.max(0, Math.min(1, Number(v) || 0))
+    if (this.reverbReturn && this.audioCtx) {
+      this.reverbReturn.gain.setTargetAtTime(this.reverbMix, this.audioCtx.currentTime, 0.05)
     }
   }
 
@@ -136,22 +234,24 @@ export class SoundEngine {
     }
     return this._stereoPanSupport
   }
-  _pannedOut(pan) {
+  // wet=true 时走“干声 + 混响送出”的总线；wet=false 只出干声
+  _pannedOut(pan, wet = true) {
+    const dest = (wet && this.voiceBus) || this.masterGain
     const pv = Math.max(-1, Math.min(1, Number(pan) || 0))
     if (pv !== 0 && this._panSupported()) {
       const node = this.audioCtx.createStereoPanner()
       node.pan.value = pv
-      node.connect(this.masterGain)
+      node.connect(dest)
       return node
     }
-    return this.masterGain
+    return dest
   }
 
   /* ---------- 合成单音 ---------- */
-  _strike(freq, t0, type, peak, decay, pan) {
+  _strike(freq, t0, type, peak, decay, pan, wet = true) {
     const osc = this.audioCtx.createOscillator()
     const g = this.audioCtx.createGain()
-    const out = this._pannedOut(pan)
+    const out = this._pannedOut(pan, wet)
     osc.type = type
     osc.frequency.value = freq
     g.gain.setValueAtTime(0.0001, t0)
@@ -164,12 +264,12 @@ export class SoundEngine {
     osc.onended = () => {
       osc.disconnect()
       g.disconnect()
-      if (out !== this.masterGain) out.disconnect()
+      if (out !== this.masterGain && out !== this.voiceBus) out.disconnect()
     }
   }
 
   // 撞击瞬态（短促带通噪声，模拟“触碰直线”的物理感）
-  _noiseHit(t0, dur, pan) {
+  _noiseHit(t0, dur, pan, wet = true) {
     if (!this.noiseBuffer || !this.masterGain) return
     const src = this.audioCtx.createBufferSource()
     src.buffer = this.noiseBuffer
@@ -178,7 +278,7 @@ export class SoundEngine {
     filter.frequency.value = 2600
     filter.Q.value = 0.8
     const g = this.audioCtx.createGain()
-    const out = this._pannedOut(pan)
+    const out = this._pannedOut(pan, wet)
     g.gain.setValueAtTime(0.0001, t0)
     g.gain.exponentialRampToValueAtTime(0.45, t0 + 0.005)
     g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur)
@@ -191,23 +291,25 @@ export class SoundEngine {
       src.disconnect()
       filter.disconnect()
       g.disconnect()
-      if (out !== this.masterGain) out.disconnect()
+      if (out !== this.masterGain && out !== this.voiceBus) out.disconnect()
     }
   }
 
   // 真正调度一个频率（含泛音与可选撞击瞬态）；仅在 running 且未静音时执行
   // opts.soft  : true 时整体更轻更短（用于重叠和声音程等）
   // opts.impact: false 时不加物理撞击瞬态噪声（用于纯钟琴音色页面）
+  // opts.reverb: false 时该音只出干声，不进混响
   _scheduleFreq(freq, pan = 0, opts = {}) {
     if (this.muted || !this.audioCtx || !this.masterGain || this.audioCtx.state !== 'running') return false
     const soft = !!opts.soft
     const withImpact = opts.impact !== false
+    const wet = opts.reverb !== false // 单音级开关：可指定某个音不进混响
     const t0 = this.audioCtx.currentTime
     try {
-      if (withImpact) this._noiseHit(t0, 0.035, pan)              // 物理撞击瞬态（可关闭）
-      this._strike(freq, t0, 'sine', soft ? 0.2 : 0.5, soft ? 0.5 : 0.9, pan)       // 基音
-      this._strike(freq * 2.01, t0, 'sine', soft ? 0.05 : 0.12, soft ? 0.18 : 0.28, pan) // 八度泛音“叮”
-      this._strike(freq * 4.07, t0, 'sine', soft ? 0.02 : 0.06, 0.1, pan) // 高频亮色
+      if (withImpact) this._noiseHit(t0, 0.035, pan, wet)              // 物理撞击瞬态（可关闭）
+      this._strike(freq, t0, 'sine', soft ? 0.2 : 0.5, soft ? 0.5 : 0.9, pan, wet)       // 基音
+      this._strike(freq * 2.01, t0, 'sine', soft ? 0.05 : 0.12, soft ? 0.18 : 0.28, pan, wet) // 八度泛音“叮”
+      this._strike(freq * 4.07, t0, 'sine', soft ? 0.02 : 0.06, 0.1, pan, wet) // 高频亮色
       this.stats.notesScheduled++
       return true
     } catch (err) {
@@ -259,8 +361,10 @@ export class SoundEngine {
     return {
       ctxState: this.audioCtx ? this.audioCtx.state : 'none',
       muted: this.muted,
+      reverb: { enabled: !!this.convolver, mix: this.reverbMix, time: this.reverbTime },
       stats: this.stats,
       unlock: () => this.unlock(),
+      setReverbMix: (v) => this.setReverbMix(v),
     }
   }
 
@@ -271,6 +375,12 @@ export class SoundEngine {
     }
     this.audioCtx = null
     this.masterGain = null
+    this.voiceBus = null
+    this.reverbSend = null
+    this.reverbPreDelay = null
+    this.reverbDamp = null
+    this.convolver = null
+    this.reverbReturn = null
     this.noiseBuffer = null
     this.pending = []
   }

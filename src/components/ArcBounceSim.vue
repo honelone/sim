@@ -71,7 +71,7 @@ const sim = {
 // Web Audio 初始化与播放由可复用的音效引擎负责（详见 src/audio/soundEngine.js）
 const AUDIO_DEBUG = typeof location !== 'undefined' && /[?&]debug(?:=|&|$)/.test(location.search)
 // 音效引擎实例：页面只负责“碰撞时调用 engine.play(freq, pan)”
-const engine = new SoundEngine({ masterVolume: 0.6, debug: AUDIO_DEBUG })
+const engine = new SoundEngine({ masterVolume: 0.6, reverbMix: 0.7, reverbTime: 1.4 , debug: AUDIO_DEBUG })
 // 与点一一对应的音效表：基础 → 降调 → 升调组，按 assembleScale 顺序依次添加
 const scale = computed(() => assembleScale(effCount.value))
 // 与点一一对应的彩虹配色：两端点取彩虹两端色，中间按渐变顺序标注

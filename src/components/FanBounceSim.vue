@@ -85,7 +85,7 @@ const meta = computed(() =>
 )
 
 /* ---------- 音频引擎（可复用模块，见 src/audio/soundEngine.js） ---------- */
-const engine = new SoundEngine({ masterVolume: 0.5, debug: AUDIO_DEBUG })
+const engine = new SoundEngine({ masterVolume: 0.5, reverbMix: 0.7, reverbTime: 1.4 , debug: AUDIO_DEBUG })
 let noticeTimer = 0
 
 /* ---------- 运行时几何/状态 ---------- */

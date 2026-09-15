@@ -72,7 +72,7 @@ function stepCount(delta) {
 }
 
 /* ---------- 音频引擎（可复用模块，见 src/audio/soundEngine.js） ---------- */
-const engine = new SoundEngine({ masterVolume: 0.5, debug: AUDIO_DEBUG })
+const engine = new SoundEngine({ masterVolume: 0.5, reverbMix: 0.8, reverbTime: 3 , debug: AUDIO_DEBUG })
 let highlightTimer = 0
 // 页面自身统计（经过原点 / 两点重叠次数）；音频链路指标由 engine.snapshot() 暴露
 const stats = { passes: 0, overlaps: 0 }
