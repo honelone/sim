@@ -4,10 +4,10 @@ const emit = defineEmits(['select'])
 
 // 页面顺序与 App 的切换顺序保持一致
 const pages = [
-  { key: 'fan', icon: 'fan', label: 'V形扇摆', title: 'V 形夹角 135° · 30 层彩虹弧摆 · 撞线奏音阶' },
-  { key: 'ellipse', icon: 'ell', label: '层叠发散', title: '椭圆轨道 · 145 点分 10 层层层发散 · 每层每点碰撞「点数+1」次 · 末次碰撞恰在 90s 自然回归原点' },
-  { key: 'orbit', icon: 'orb', label: '圆轨音阶', title: '圆形轨道 · 7 个变速点 · 经过顶点奏响音阶' },
-  { key: 'arc', icon: 'arc', label: '半圆弹跳', title: '半圆往返 · 弹性反弹 · 音阶碰撞' },
+  { key: 'arc', icon: 'arc', label: '半圆弹跳' },
+  { key: 'ellipse', icon: 'ell', label: '层叠发散' },
+  { key: 'orbit', icon: 'orb', label: '圆轨音阶' },
+  { key: 'fan', icon: 'fan', label: 'V形扇摆'  },
 ]
 </script>
 
@@ -18,7 +18,6 @@ const pages = [
       :key="p.key"
       class="ps-btn"
       :class="{ on: active === p.key }"
-      :title="p.title"
       @click="emit('select', p.key)"
     >
       <i :class="p.icon"></i>{{ p.label }}

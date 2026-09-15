@@ -7,7 +7,7 @@ import FanBounceSim from './components/FanBounceSim.vue'
 import EllipseSwarmSim from './components/EllipseSwarmSim.vue'
 
 // 页面切换（四个实验页面互斥渲染）
-const page = ref('fan')   // 默认进入「V形扇摆」
+const page = ref('arc')   // 默认进入「V形扇摆」
 </script>
 
 <template>
