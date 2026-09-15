@@ -1,23 +1,14 @@
 <script setup>
-import { ref } from 'vue'
+import { RouterView } from 'vue-router'
 import SimNav from './components/SimNav.vue'
-import ArcBounceSim from './components/ArcBounceSim.vue'
-import OrbitHarmonySim from './components/OrbitHarmonySim.vue'
-import FanBounceSim from './components/FanBounceSim.vue'
-import EllipseSwarmSim from './components/EllipseSwarmSim.vue'
-
-// 页面切换（四个实验页面互斥渲染）
-const page = ref('arc')   // 默认进入「V形扇摆」
 </script>
 
 <template>
   <div class="app-shell">
-    <SimNav :active="page" @select="page = $event" />
+    <SimNav />
 
-    <EllipseSwarmSim v-if="page === 'ellipse'" />
-    <FanBounceSim v-else-if="page === 'fan'" />
-    <OrbitHarmonySim v-else-if="page === 'orbit'" />
-    <ArcBounceSim v-else />
+    <!-- 每个 tab 对应一个路由页面，切换即销毁/重建（各实验自带动画循环与音频上下文） -->
+    <RouterView />
   </div>
 </template>
 

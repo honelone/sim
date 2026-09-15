@@ -1,27 +1,27 @@
 <script setup>
-const props = defineProps({ active: String })
-const emit = defineEmits(['select'])
+import { computed } from 'vue'
+import { RouterLink } from 'vue-router'
+import { routes } from '../router/index.js'
 
-// 页面顺序与 App 的切换顺序保持一致
-const pages = [
-  { key: 'arc', icon: 'arc', label: '半圆弹跳' },
-  { key: 'ellipse', icon: 'ell', label: '层叠发散' },
-  { key: 'orbit', icon: 'orb', label: '圆轨音阶' },
-  { key: 'fan', icon: 'fan', label: 'V形扇摆'  },
-]
+// 页面顺序与路由表保持一致（只取带 meta.label 的实验页，跳过重定向与兜底路由）
+const pages = computed(() =>
+  routes
+    .filter((r) => r.meta?.label)
+    .map((r) => ({ key: r.name, to: r.path, icon: r.meta.icon, label: r.meta.label }))
+)
 </script>
 
 <template>
   <nav class="page-switch">
-    <button
+    <RouterLink
       v-for="p in pages"
       :key="p.key"
       class="ps-btn"
-      :class="{ on: active === p.key }"
-      @click="emit('select', p.key)"
+      active-class="on"
+      :to="p.to"
     >
       <i :class="p.icon"></i>{{ p.label }}
-    </button>
+    </RouterLink>
   </nav>
 </template>
 
@@ -56,6 +56,7 @@ const pages = [
   border-radius: 999px;
   cursor: pointer;
   white-space: nowrap;
+  text-decoration: none;
   transition: all 0.16s ease;
 }
 .ps-btn:hover {
